@@ -270,18 +270,29 @@ async fn crawl_batch(
     }
 
     let start = Instant::now();
-    let mut results = Vec::with_capacity(payload.requests.len());
+    let mut tasks = Vec::with_capacity(payload.requests.len());
     for item in payload.requests {
-        match crawl_once(&state, item).await {
-            Ok(response) => results.push(BatchCrawlItem {
+        let state = state.clone();
+        tasks.push(tokio::spawn(async move { crawl_once(&state, item).await }));
+    }
+
+    let mut results = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        match task.await {
+            Ok(Ok(response)) => results.push(BatchCrawlItem {
                 ok: true,
                 response: Some(response),
                 error: None,
             }),
-            Err(err) => results.push(BatchCrawlItem {
+            Ok(Err(err)) => results.push(BatchCrawlItem {
                 ok: false,
                 response: None,
                 error: Some(err.message),
+            }),
+            Err(join_err) => results.push(BatchCrawlItem {
+                ok: false,
+                response: None,
+                error: Some(format!("batch worker join error: {join_err}")),
             }),
         }
     }
