@@ -570,56 +570,125 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
         .unwrap_or(ScrapeResponseFormat::Text);
     let redirect_limit = payload.redirect_limit.unwrap_or(10);
     let crawl_mode = payload.crawl_mode.clone().unwrap_or(CrawlMode::Http);
-    let proxies = resolve_request_proxies(payload.proxies, state)?;
-
-    let mut website = Website::new(&payload.url);
-    website
-        .with_depth(0)
-        .with_limit(1)
-        .with_concurrency_limit(Some(1))
-        .with_request_timeout(Some(Duration::from_secs(request_timeout_secs)))
-        .with_crawl_timeout(Some(Duration::from_secs(crawl_timeout_secs)))
-        .with_respect_robots_txt(payload.respect_robots_txt.unwrap_or(true))
-        .with_subdomains(false)
-        .with_redirect_limit(redirect_limit)
-        .with_return_page_links(true);
-
-    if let Some(policy) = payload.redirect_policy {
-        website.with_redirect_policy(policy.into());
-    }
-    if let Some(proxy_list) = proxies {
-        website.with_proxies(Some(proxy_list));
-    }
-    if let Some(user_agent) = payload.user_agent.as_deref() {
-        website.with_user_agent(Some(user_agent));
-    }
-    if let Some(referer) = payload.referer {
-        website.with_referer(Some(referer));
-    }
-    apply_anti_bot_profile(
-        &mut website,
-        payload
-            .anti_bot_profile
-            .unwrap_or(AntiBotProfile::CamoufoxLike),
-    );
-    configure_browser_mode(&mut website, payload.browser.as_ref(), &crawl_mode);
+    let respect_robots_txt = payload.respect_robots_txt.unwrap_or(true);
+    let has_explicit_proxies = payload.proxies.is_some();
+    let mut selected_proxies = resolve_request_proxies(payload.proxies.clone(), state)?;
+    let requested_profile = payload
+        .anti_bot_profile
+        .clone()
+        .unwrap_or(AntiBotProfile::CamoufoxLike);
 
     let start = Instant::now();
     let mut mode_used = crawl_mode.clone();
-    let page = match crawl_mode {
-        CrawlMode::Http => fetch_single_page_http(&website, &payload.url).await,
-        CrawlMode::Browser => fetch_single_page_browser(website.clone()).await,
-        CrawlMode::Auto => {
-            let http_page = fetch_single_page_http(&website, &payload.url).await;
-            if should_fallback_to_browser_page(http_page.as_ref(), include_content) {
-                mode_used = CrawlMode::Browser;
-                fetch_single_page_browser(website.clone())
-                    .await
-                    .or(http_page)
+    let page = match &crawl_mode {
+        CrawlMode::Browser => {
+            let browser_website = build_scrape_website(
+                &payload.url,
+                request_timeout_secs,
+                crawl_timeout_secs,
+                respect_robots_txt,
+                redirect_limit,
+                payload.redirect_policy.as_ref(),
+                selected_proxies.clone(),
+                payload.user_agent.as_deref(),
+                payload.referer.as_ref(),
+                requested_profile.clone(),
+                payload.browser.as_ref(),
+                &CrawlMode::Browser,
+            );
+            fetch_single_page_browser(browser_website).await
+        }
+        CrawlMode::Http | CrawlMode::Auto => {
+            let mut current_page = {
+                let http_website = build_scrape_website(
+                    &payload.url,
+                    request_timeout_secs,
+                    crawl_timeout_secs,
+                    respect_robots_txt,
+                    redirect_limit,
+                    payload.redirect_policy.as_ref(),
+                    selected_proxies.clone(),
+                    payload.user_agent.as_deref(),
+                    payload.referer.as_ref(),
+                    requested_profile.clone(),
+                    payload.browser.as_ref(),
+                    &CrawlMode::Http,
+                );
+                fetch_single_page_http(&http_website, &payload.url).await
+            };
+
+            // Retry with a rotated proxy batch when defaults are in use.
+            if should_retry_scrape_page(current_page.as_ref(), include_content)
+                && !has_explicit_proxies
+                && !state.config.default_proxies.is_empty()
+            {
+                selected_proxies = resolve_request_proxies(None, state)?;
+                let rotated_retry_website = build_scrape_website(
+                    &payload.url,
+                    request_timeout_secs,
+                    crawl_timeout_secs,
+                    respect_robots_txt,
+                    redirect_limit,
+                    payload.redirect_policy.as_ref(),
+                    selected_proxies.clone(),
+                    payload.user_agent.as_deref(),
+                    payload.referer.as_ref(),
+                    requested_profile.clone(),
+                    payload.browser.as_ref(),
+                    &CrawlMode::Http,
+                );
+                current_page = fetch_single_page_http(&rotated_retry_website, &payload.url).await;
+            }
+
+            // Hardened retry with camoufox-like profile.
+            if should_retry_scrape_page(current_page.as_ref(), include_content) {
+                if !has_explicit_proxies && !state.config.default_proxies.is_empty() {
+                    selected_proxies = resolve_request_proxies(None, state)?;
+                }
+                let hardened_website = build_scrape_website(
+                    &payload.url,
+                    request_timeout_secs,
+                    crawl_timeout_secs,
+                    respect_robots_txt,
+                    redirect_limit,
+                    payload.redirect_policy.as_ref(),
+                    selected_proxies.clone(),
+                    payload.user_agent.as_deref(),
+                    payload.referer.as_ref(),
+                    AntiBotProfile::CamoufoxLike,
+                    payload.browser.as_ref(),
+                    &CrawlMode::Http,
+                );
+                current_page = fetch_single_page_http(&hardened_website, &payload.url).await;
+            }
+
+            // Final browser fallback for stubborn pages/challenges.
+            if should_retry_scrape_page(current_page.as_ref(), include_content) {
+                let browser_website = build_scrape_website(
+                    &payload.url,
+                    request_timeout_secs,
+                    crawl_timeout_secs,
+                    respect_robots_txt,
+                    redirect_limit,
+                    payload.redirect_policy.as_ref(),
+                    selected_proxies.clone(),
+                    payload.user_agent.as_deref(),
+                    payload.referer.as_ref(),
+                    AntiBotProfile::CamoufoxLike,
+                    payload.browser.as_ref(),
+                    &CrawlMode::Browser,
+                );
+                if let Some(browser_page) = fetch_single_page_browser(browser_website).await {
+                    mode_used = CrawlMode::Browser;
+                    current_page = Some(browser_page);
+                } else {
+                    mode_used = CrawlMode::Http;
+                }
             } else {
                 mode_used = CrawlMode::Http;
-                http_page
             }
+
+            current_page
         }
     };
     let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -637,6 +706,99 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
             )
         }),
     })
+}
+
+fn build_scrape_website(
+    url: &str,
+    request_timeout_secs: u64,
+    crawl_timeout_secs: u64,
+    respect_robots_txt: bool,
+    redirect_limit: usize,
+    redirect_policy: Option<&RedirectPolicyRequest>,
+    proxies: Option<Vec<String>>,
+    user_agent: Option<&str>,
+    referer: Option<&String>,
+    anti_bot_profile: AntiBotProfile,
+    browser: Option<&BrowserModeConfig>,
+    crawl_mode: &CrawlMode,
+) -> Website {
+    let mut website = Website::new(url);
+    website
+        .with_depth(0)
+        .with_limit(1)
+        .with_concurrency_limit(Some(1))
+        .with_request_timeout(Some(Duration::from_secs(request_timeout_secs)))
+        .with_crawl_timeout(Some(Duration::from_secs(crawl_timeout_secs)))
+        .with_respect_robots_txt(respect_robots_txt)
+        .with_subdomains(false)
+        .with_redirect_limit(redirect_limit)
+        .with_return_page_links(true);
+
+    if let Some(policy) = redirect_policy.cloned() {
+        website.with_redirect_policy(policy.into());
+    }
+    if let Some(proxy_list) = proxies {
+        website.with_proxies(Some(proxy_list));
+    }
+    if let Some(user_agent) = user_agent {
+        website.with_user_agent(Some(user_agent));
+    }
+    if let Some(referer) = referer {
+        website.with_referer(Some(referer.clone()));
+    }
+    apply_anti_bot_profile(&mut website, anti_bot_profile);
+    configure_browser_mode(&mut website, browser, crawl_mode);
+
+    website
+}
+
+fn should_retry_scrape_page(page: Option<&Page>, require_content: bool) -> bool {
+    let Some(page) = page else {
+        return true;
+    };
+
+    let status = page.status_code.as_u16();
+    if matches!(status, 403 | 407 | 408 | 409 | 410 | 425 | 429 | 451) || status >= 500 {
+        return true;
+    }
+
+    let html = page.get_html();
+    let html_trimmed = html.trim();
+    if require_content && html_trimmed.is_empty() {
+        return true;
+    }
+
+    if is_challenge_or_block_page(html_trimmed) {
+        return true;
+    }
+
+    if require_content {
+        let text = html_to_text(html_trimmed);
+        let token_count = text.split_whitespace().count();
+        if html_trimmed.len() < 512 || token_count < 40 {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_challenge_or_block_page(html: &str) -> bool {
+    let content = html.to_ascii_lowercase();
+    let markers = [
+        "cloudflare",
+        "captcha",
+        "access denied",
+        "verify you are a human",
+        "attention required",
+        "datadome",
+        "akamai",
+        "bot detection",
+        "security check",
+        "please enable javascript and cookies",
+        "oops!! something went wrong",
+    ];
+    markers.iter().any(|marker| content.contains(marker))
 }
 
 fn map_page(
