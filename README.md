@@ -49,7 +49,16 @@ curl -s -X POST http://localhost:8080/crawl \
     "respect_robots_txt": true,
     "subdomains": false,
     "include_content": false,
-    "max_content_chars": 4000
+    "max_content_chars": 4000,
+    "proxies": [
+      "http://user:pass@proxy-a.example:8080",
+      "socks5://proxy-b.example:1080"
+    ],
+    "anti_bot_profile": "camoufox_like",
+    "user_agent": "Mozilla/5.0 ...",
+    "referer": "https://www.google.com/",
+    "redirect_policy": "loose",
+    "redirect_limit": 10
   }'
 ```
 
@@ -65,6 +74,12 @@ Request fields:
 - `subdomains` (optional, default false)
 - `include_content` (optional, default false)
 - `max_content_chars` (optional)
+- `proxies` (optional): list of `http://`, `https://`, `socks5://`, or `socks5h://` proxies
+- `anti_bot_profile` (optional): `off`, `basic`, or `camoufox_like`
+- `user_agent` (optional): override User-Agent
+- `referer` (optional): set Referer header
+- `redirect_policy` (optional): `loose`, `strict`, `none`
+- `redirect_limit` (optional): max redirects
 
 Response (shape):
 
@@ -89,6 +104,36 @@ Response (shape):
 ```
 
 If crawler capacity is exhausted, the API returns `429 Too Many Requests`.
+
+### Batch crawl
+
+`POST /crawl/batch`
+
+Runs multiple crawl requests concurrently for higher throughput.
+
+Example:
+
+```bash
+curl -s -X POST http://localhost:8080/crawl/batch \
+  -H 'content-type: application/json' \
+  -d '{
+    "requests": [
+      {
+        "url": "https://www.rust-lang.org",
+        "max_depth": 1,
+        "max_pages": 40,
+        "anti_bot_profile": "basic"
+      },
+      {
+        "url": "https://tokio.rs",
+        "max_depth": 1,
+        "max_pages": 40,
+        "proxies": ["http://proxy.example:8080"],
+        "anti_bot_profile": "camoufox_like"
+      }
+    ]
+  }'
+```
 
 ## Local development
 
@@ -119,6 +164,9 @@ Environment variables:
 - `MAX_CRAWL_TIMEOUT_SECS` (default: `300`)
 - `DEFAULT_CONTENT_CHARS` (default: `4000`)
 - `MAX_CONTENT_CHARS` (default: `100000`)
+- `DEFAULT_BATCH_SIZE` (default: `4`)
+- `MAX_BATCH_SIZE` (default: `64`)
+- `MAX_PROXIES_PER_REQUEST` (default: `128`)
 
 ## Docker
 
@@ -143,5 +191,7 @@ docker compose up --build -d
 ## Notes on performance
 
 - `spider` performs async crawling internally; tune `crawl_concurrency` and page/depth limits to fit your target.
+- Prefer `/crawl/batch` when you have many independent URLs and want the server to schedule them concurrently.
+- Use rotating proxy lists with `proxies` + `anti_bot_profile=camoufox_like` on stricter targets.
 - Protect upstream sites and your own infra by respecting robots and keeping hard bounds enabled.
 - For production, place this service behind a reverse proxy/load balancer and tune process CPU/memory limits.
