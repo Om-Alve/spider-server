@@ -79,13 +79,9 @@ struct CrawlResponse {
 #[derive(Debug, Deserialize)]
 struct ScrapeRequest {
     url: String,
-    max_depth: Option<usize>,
-    max_pages: Option<u32>,
-    crawl_concurrency: Option<usize>,
     request_timeout_secs: Option<u64>,
     crawl_timeout_secs: Option<u64>,
     respect_robots_txt: Option<bool>,
-    subdomains: Option<bool>,
     include_content: Option<bool>,
     max_content_chars: Option<usize>,
     proxies: Option<Vec<String>>,
@@ -95,8 +91,6 @@ struct ScrapeRequest {
     redirect_policy: Option<RedirectPolicyRequest>,
     redirect_limit: Option<usize>,
     crawl_mode: Option<CrawlMode>,
-    auto_browser_min_pages: Option<usize>,
-    auto_browser_min_links: Option<usize>,
     browser: Option<BrowserModeConfig>,
 }
 
@@ -453,18 +447,28 @@ async fn crawl_once(state: &AppState, payload: CrawlRequest) -> Result<CrawlResp
     configure_browser_mode(&mut website, payload.browser.as_ref(), &crawl_mode);
 
     let start = Instant::now();
-    run_crawl_mode(&mut website, &crawl_mode).await;
-    if matches!(crawl_mode, CrawlMode::Auto)
-        && should_fallback_to_browser(&website, auto_min_pages, auto_min_links)
+    execute_crawl_with_auto_fallback(
+        &mut website,
+        &crawl_mode,
+        payload.browser.as_ref(),
+        auto_min_pages,
+        auto_min_links,
+    )
+    .await;
+    if let Some(recovered_page) =
+        recover_single_page_crawl(&website, &crawl_mode, depth, pages).await
     {
-        let mut browser_website = website.clone();
-        configure_browser_mode(
-            &mut browser_website,
-            payload.browser.as_ref(),
-            &CrawlMode::Browser,
-        );
-        run_crawl_mode(&mut browser_website, &CrawlMode::Browser).await;
-        website = browser_website;
+        return Ok(CrawlResponse {
+            root_url: payload.url,
+            crawl_duration_ms: start.elapsed().as_millis() as u64,
+            pages_fetched: 1,
+            unique_links_seen: website.get_links().len().max(1),
+            pages: vec![map_page(
+                &recovered_page,
+                include_content,
+                max_content_chars,
+            )],
+        });
     }
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
@@ -496,21 +500,6 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
         .try_acquire_owned()
         .map_err(|_| ApiError::too_many_requests("crawler is saturated, retry later"))?;
 
-    let depth = clamp(
-        payload.max_depth.unwrap_or(1),
-        0,
-        state.config.max_allowed_depth,
-    );
-    let pages = clamp(
-        payload.max_pages.unwrap_or(20),
-        1,
-        state.config.max_allowed_pages,
-    );
-    let concurrency = clamp(
-        payload.crawl_concurrency.unwrap_or(8),
-        1,
-        state.config.max_allowed_crawl_concurrency,
-    );
     let request_timeout_secs = clamp(
         payload
             .request_timeout_secs
@@ -535,19 +524,17 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
     let include_content = payload.include_content.unwrap_or(true);
     let redirect_limit = payload.redirect_limit.unwrap_or(10);
     let crawl_mode = payload.crawl_mode.clone().unwrap_or(CrawlMode::Http);
-    let auto_min_pages = payload.auto_browser_min_pages.unwrap_or(1);
-    let auto_min_links = payload.auto_browser_min_links.unwrap_or(20);
     let proxies = normalize_proxies(payload.proxies, state.config.max_proxies_per_request)?;
 
     let mut website = Website::new(&payload.url);
     website
-        .with_depth(depth)
-        .with_limit(pages)
-        .with_concurrency_limit(Some(concurrency))
+        .with_depth(0)
+        .with_limit(1)
+        .with_concurrency_limit(Some(1))
         .with_request_timeout(Some(Duration::from_secs(request_timeout_secs)))
         .with_crawl_timeout(Some(Duration::from_secs(crawl_timeout_secs)))
         .with_respect_robots_txt(payload.respect_robots_txt.unwrap_or(true))
-        .with_subdomains(payload.subdomains.unwrap_or(false))
+        .with_subdomains(false)
         .with_redirect_limit(redirect_limit)
         .with_return_page_links(true);
 
@@ -571,31 +558,30 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
 
     let start = Instant::now();
     let mut mode_used = crawl_mode.clone();
-    run_crawl_mode(&mut website, &crawl_mode).await;
-    if matches!(crawl_mode, CrawlMode::Auto)
-        && should_fallback_to_browser(&website, auto_min_pages, auto_min_links)
-    {
-        let mut browser_website = website.clone();
-        configure_browser_mode(
-            &mut browser_website,
-            payload.browser.as_ref(),
-            &CrawlMode::Browser,
-        );
-        run_crawl_mode(&mut browser_website, &CrawlMode::Browser).await;
-        website = browser_website;
-        mode_used = CrawlMode::Browser;
-    } else if matches!(crawl_mode, CrawlMode::Auto) {
-        mode_used = CrawlMode::Http;
-    }
+    let page = match crawl_mode {
+        CrawlMode::Http => fetch_single_page_http(&website, &payload.url).await,
+        CrawlMode::Browser => fetch_single_page_browser(website.clone()).await,
+        CrawlMode::Auto => {
+            let http_page = fetch_single_page_http(&website, &payload.url).await;
+            if should_fallback_to_browser_page(http_page.as_ref(), include_content) {
+                mode_used = CrawlMode::Browser;
+                fetch_single_page_browser(website.clone())
+                    .await
+                    .or(http_page)
+            } else {
+                mode_used = CrawlMode::Http;
+                http_page
+            }
+        }
+    };
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     Ok(ScrapeResponse {
         root_url: payload.url,
         scrape_duration_ms: elapsed_ms,
         mode_used,
-        page: website
-            .get_pages()
-            .and_then(|pages| pages.first())
+        page: page
+            .as_ref()
             .map(|value| map_page(value, include_content, max_content_chars)),
     })
 }
@@ -663,6 +649,135 @@ async fn run_crawl_mode(website: &mut Website, mode: &CrawlMode) {
         // auto starts in HTTP mode; optional browser fallback handled by caller.
         CrawlMode::Auto => website.scrape_raw().await,
     }
+}
+
+async fn execute_crawl_with_auto_fallback(
+    website: &mut Website,
+    mode: &CrawlMode,
+    browser: Option<&BrowserModeConfig>,
+    auto_min_pages: usize,
+    auto_min_links: usize,
+) -> CrawlMode {
+    run_crawl_mode(website, mode).await;
+
+    if matches!(mode, CrawlMode::Auto)
+        && should_fallback_to_browser(website, auto_min_pages, auto_min_links)
+    {
+        let mut browser_website = website.clone();
+        configure_browser_mode(&mut browser_website, browser, &CrawlMode::Browser);
+        run_crawl_mode(&mut browser_website, &CrawlMode::Browser).await;
+        *website = browser_website;
+        CrawlMode::Browser
+    } else if matches!(mode, CrawlMode::Auto) {
+        CrawlMode::Http
+    } else {
+        mode.clone()
+    }
+}
+
+async fn recover_single_page_crawl(
+    website: &Website,
+    mode: &CrawlMode,
+    requested_depth: usize,
+    requested_pages: u32,
+) -> Option<Page> {
+    let pages_fetched = website.get_pages().map_or(0, Vec::len);
+    let needs_single_page_recovery =
+        requested_depth == 0 && requested_pages == 1 && pages_fetched == 0;
+    if !needs_single_page_recovery {
+        return None;
+    }
+
+    fetch_single_page_from_mode(website, mode).await
+}
+
+async fn fetch_single_page_http(website: &Website, url: &str) -> Option<Page> {
+    let client = website.configure_http_client();
+    let initial = Page::new_page(url, &client).await;
+    if initial.status_code.is_success() && !initial.get_html().trim().is_empty() {
+        return Some(initial);
+    }
+
+    // Fallback to a bounded crawl when direct one-shot fetch yields an error page.
+    let mut retry = website.clone();
+    retry.with_depth(1).with_limit(3);
+    retry.scrape_raw().await;
+    let target = url.to_string();
+    let recovered = retry.get_pages().and_then(|pages| {
+        pages
+            .iter()
+            .find(|page| {
+                urls_match(page.get_url(), &target) || urls_match(page.get_url_final(), &target)
+            })
+            .cloned()
+            .or_else(|| pages.first().cloned())
+    });
+
+    recovered.or(Some(initial))
+}
+
+async fn fetch_single_page_from_mode(website: &Website, mode: &CrawlMode) -> Option<Page> {
+    match mode {
+        CrawlMode::Http => fetch_single_page_http(website, website.get_url()).await,
+        CrawlMode::Browser => fetch_single_page_browser(website.clone()).await,
+        CrawlMode::Auto => {
+            let http_page = fetch_single_page_http(website, website.get_url()).await;
+            if should_fallback_to_browser_page(http_page.as_ref(), true) {
+                fetch_single_page_browser(website.clone())
+                    .await
+                    .or(http_page)
+            } else {
+                http_page
+            }
+        }
+    }
+}
+
+async fn fetch_single_page_browser(mut website: Website) -> Option<Page> {
+    let mut rx = website.subscribe(8);
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+    let target_url = website.get_url().to_string();
+
+    let crawl = async move {
+        website.fetch_chrome(Some(target_url.as_str())).await;
+        website.unsubscribe();
+        let _ = done_tx.send(());
+    };
+
+    let sub = async {
+        let mut page = None;
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut done_rx => break,
+                result = rx.recv() => {
+                    if let Ok(next_page) = result {
+                        page = Some(next_page);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        page
+    };
+
+    let (page, _) = tokio::join!(sub, crawl);
+    page
+}
+
+fn should_fallback_to_browser_page(page: Option<&Page>, require_content: bool) -> bool {
+    let Some(page) = page else {
+        return true;
+    };
+    if !page.status_code.is_success() {
+        return true;
+    }
+    require_content && page.get_html().trim().is_empty()
+}
+
+fn urls_match(a: &str, b: &str) -> bool {
+    a == b || a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
 fn should_fallback_to_browser(website: &Website, min_pages: usize, min_links: usize) -> bool {
