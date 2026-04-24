@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     io::Cursor,
     net::SocketAddr,
@@ -22,7 +23,11 @@ use spider::configuration::RedirectPolicy;
 use spider::features::chrome_common::RequestInterceptConfiguration;
 use spider::page::Page;
 use spider::website::Website;
-use tokio::{net::TcpListener, sync::Semaphore, time::Instant};
+use tokio::{
+    net::TcpListener,
+    sync::{RwLock, Semaphore},
+    time::Instant,
+};
 use tower::{limit::ConcurrencyLimitLayer, ServiceBuilder};
 use tower_http::{compression::CompressionLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::{info, warn};
@@ -33,7 +38,11 @@ struct AppState {
     config: Arc<ServerConfig>,
     crawl_permits: Arc<Semaphore>,
     proxy_rotation_cursor: Arc<AtomicUsize>,
+    domain_failure_memory: Arc<RwLock<HashMap<String, i32>>>,
 }
+
+const DOMAIN_FORCE_BROWSER_THRESHOLD: i32 = 3;
+const DOMAIN_MEMORY_MAX_SCORE: i32 = 8;
 
 #[derive(Clone)]
 struct ServerConfig {
@@ -289,6 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         crawl_permits: Arc::new(Semaphore::new(max_concurrent_crawls)),
         proxy_rotation_cursor: Arc::new(AtomicUsize::new(0)),
+        domain_failure_memory: Arc::new(RwLock::new(HashMap::new())),
     };
 
     if state.config.default_proxies.is_empty() {
@@ -577,6 +587,12 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
         .anti_bot_profile
         .clone()
         .unwrap_or(AntiBotProfile::CamoufoxLike);
+    let host_key = extract_host_key(&payload.url);
+    let force_browser_for_domain = if let Some(host) = host_key.as_deref() {
+        domain_should_force_browser(state, host).await
+    } else {
+        false
+    };
 
     let start = Instant::now();
     let mut mode_used = crawl_mode.clone();
@@ -599,7 +615,31 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
             fetch_single_page_browser(browser_website).await
         }
         CrawlMode::Http | CrawlMode::Auto => {
-            let mut current_page = {
+            let mut current_page = None;
+
+            // If this domain repeatedly fails in HTTP mode, jump to browser first.
+            if force_browser_for_domain {
+                let warm_browser_website = build_scrape_website(
+                    &payload.url,
+                    request_timeout_secs,
+                    crawl_timeout_secs,
+                    respect_robots_txt,
+                    redirect_limit,
+                    payload.redirect_policy.as_ref(),
+                    selected_proxies.clone(),
+                    payload.user_agent.as_deref(),
+                    payload.referer.as_ref(),
+                    AntiBotProfile::CamoufoxLike,
+                    payload.browser.as_ref(),
+                    &CrawlMode::Browser,
+                );
+                current_page = fetch_single_page_browser(warm_browser_website).await;
+            }
+
+            // Primary HTTP attempt.
+            if current_page.is_none()
+                || should_retry_scrape_page(current_page.as_ref(), include_content)
+            {
                 let http_website = build_scrape_website(
                     &payload.url,
                     request_timeout_secs,
@@ -614,15 +654,14 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
                     payload.browser.as_ref(),
                     &CrawlMode::Http,
                 );
-                fetch_single_page_http(&http_website, &payload.url).await
-            };
+                current_page = fetch_single_page_http(&http_website, &payload.url).await;
+            }
 
             // Retry with a rotated proxy batch when defaults are in use.
-            if should_retry_scrape_page(current_page.as_ref(), include_content)
-                && !has_explicit_proxies
-                && !state.config.default_proxies.is_empty()
-            {
-                selected_proxies = resolve_request_proxies(None, state)?;
+            if should_retry_scrape_page(current_page.as_ref(), include_content) {
+                if !has_explicit_proxies && !state.config.default_proxies.is_empty() {
+                    selected_proxies = resolve_request_proxies(None, state)?;
+                }
                 let rotated_retry_website = build_scrape_website(
                     &payload.url,
                     request_timeout_secs,
@@ -682,7 +721,11 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
                     mode_used = CrawlMode::Browser;
                     current_page = Some(browser_page);
                 } else {
-                    mode_used = CrawlMode::Http;
+                    mode_used = if matches!(crawl_mode, CrawlMode::Auto) {
+                        CrawlMode::Auto
+                    } else {
+                        CrawlMode::Http
+                    };
                 }
             } else {
                 mode_used = CrawlMode::Http;
@@ -692,6 +735,10 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
         }
     };
     let elapsed_ms = start.elapsed().as_millis() as u64;
+    if let Some(host) = host_key.as_deref() {
+        let failed = should_retry_scrape_page(page.as_ref(), include_content);
+        update_domain_failure_memory(state, host, failed).await;
+    }
 
     Ok(ScrapeResponse {
         root_url: payload.url,
@@ -801,6 +848,24 @@ fn is_challenge_or_block_page(html: &str) -> bool {
     markers.iter().any(|marker| content.contains(marker))
 }
 
+async fn domain_should_force_browser(state: &AppState, host: &str) -> bool {
+    let memory = state.domain_failure_memory.read().await;
+    memory.get(host).copied().unwrap_or(0) >= DOMAIN_FORCE_BROWSER_THRESHOLD
+}
+
+async fn update_domain_failure_memory(state: &AppState, host: &str, failed: bool) {
+    let mut memory = state.domain_failure_memory.write().await;
+    let score = memory.entry(host.to_string()).or_insert(0);
+    if failed {
+        *score = (*score + 1).min(DOMAIN_MEMORY_MAX_SCORE);
+    } else {
+        *score = (*score - 1).max(0);
+    }
+    if *score == 0 {
+        memory.remove(host);
+    }
+}
+
 fn map_page(
     page: &Page,
     include_content: bool,
@@ -811,7 +876,14 @@ fn map_page(
     let content = html.as_ref().map(|value| {
         let rendered = match response_format.unwrap_or(&ScrapeResponseFormat::Html) {
             ScrapeResponseFormat::Html => value.to_string(),
-            ScrapeResponseFormat::Text => html_to_text(value),
+            ScrapeResponseFormat::Text => {
+                let focused = html_to_main_text(value);
+                if focused.split_whitespace().count() < 40 {
+                    html_to_text(value)
+                } else {
+                    focused
+                }
+            }
         };
         rendered.chars().take(max_content_chars).collect::<String>()
     });
@@ -1009,6 +1081,61 @@ fn html_to_text(html: &str) -> String {
     html2text::from_read(Cursor::new(html.as_bytes()), width).unwrap_or_else(|_| html.to_string())
 }
 
+fn html_to_main_text(html: &str) -> String {
+    let main_html = extract_primary_html_block(html).unwrap_or_else(|| html.to_string());
+    let focused = html_to_text(&main_html);
+    let full = html_to_text(html);
+
+    let focused_tokens = focused.split_whitespace().count();
+    let full_tokens = full.split_whitespace().count();
+
+    // Prefer focused extraction only when it still preserves a substantial
+    // amount of page text; otherwise keep the fuller text for recall.
+    if focused_tokens >= 120
+        && (full_tokens == 0 || focused_tokens * 10 >= full_tokens.saturating_mul(4))
+    {
+        focused
+    } else {
+        full
+    }
+}
+
+fn extract_primary_html_block(html: &str) -> Option<String> {
+    let doc = Html::parse_document(html);
+    let selectors = [
+        "article",
+        "main",
+        "[role=main]",
+        "section[id*=content]",
+        "div[id*=content]",
+        "section[class*=content]",
+        "div[class*=content]",
+        "section[class*=article]",
+        "div[class*=article]",
+    ];
+
+    let mut best: Option<(usize, String)> = None;
+    for selector_src in selectors {
+        let Ok(selector) = Selector::parse(selector_src) else {
+            continue;
+        };
+        for element in doc.select(&selector) {
+            let text = element.text().collect::<Vec<_>>().join(" ");
+            let token_count = text.split_whitespace().count();
+            if token_count < 40 {
+                continue;
+            }
+            let html_fragment = element.html();
+            match &best {
+                Some((best_tokens, _)) if *best_tokens >= token_count => {}
+                _ => best = Some((token_count, html_fragment)),
+            }
+        }
+    }
+
+    best.map(|(_, fragment)| fragment)
+}
+
 fn count_links_from_html(html: &str) -> usize {
     let parsed = Html::parse_document(html);
     let Ok(selector) = Selector::parse("a[href]") else {
@@ -1019,6 +1146,12 @@ fn count_links_from_html(html: &str) -> usize {
 
 fn urls_match(a: &str, b: &str) -> bool {
     a == b || a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
+fn extract_host_key(url: &str) -> Option<String> {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(|host| host.to_ascii_lowercase()))
 }
 
 fn should_fallback_to_browser(website: &Website, min_pages: usize, min_links: usize) -> bool {
