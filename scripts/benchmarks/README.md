@@ -1,4 +1,4 @@
-# Benchmark: spider-server vs Crawl4AI vs Firecrawl
+# Benchmark: spider-server (`/scrape`) vs Crawl4AI vs Firecrawl
 
 This directory contains a reproducible benchmark harness for comparing:
 
@@ -14,6 +14,10 @@ For each target URL and iteration, the harness captures:
 - extracted bytes
 - extracted link count
 - title match quality against a baseline direct HTTP fetch
+
+The spider-server runner uses `POST /scrape` (single-page extraction) instead of
+`POST /crawl`, which makes comparisons with Crawl4AI and simple HTTP fetch tools
+more apples-to-apples for page-level quality and latency.
 
 Summary metrics include:
 

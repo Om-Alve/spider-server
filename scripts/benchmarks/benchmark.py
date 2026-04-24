@@ -63,21 +63,18 @@ def canonical_title_from_requests(url: str, timeout_s: int = 30) -> str | None:
 def run_spider_server(base_url: str, target_url: str, timeout_s: int) -> RunResult:
     payload = {
         "url": target_url,
-        "max_depth": 1,
-        "max_pages": 20,
-        "crawl_concurrency": 8,
         "request_timeout_secs": min(10, timeout_s),
-        "crawl_timeout_secs": min(30, timeout_s),
+        "crawl_timeout_secs": min(20, timeout_s),
         "respect_robots_txt": True,
-        "subdomains": False,
         "include_content": True,
         "max_content_chars": 20_000,
+        "crawl_mode": "http",
     }
 
     start = time.perf_counter()
     try:
         response = requests.post(
-            f"{base_url.rstrip('/')}/crawl",
+            f"{base_url.rstrip('/')}/scrape",
             json=payload,
             timeout=timeout_s,
         )
@@ -85,22 +82,18 @@ def run_spider_server(base_url: str, target_url: str, timeout_s: int) -> RunResu
         response.raise_for_status()
         data = response.json()
 
-        pages = data.get("pages", [])
-        combined_content = "\n".join(
-            page.get("content", "") for page in pages if page.get("content")
-        )
-        title = None
-        if pages:
-            title = extract_title_from_html(pages[0].get("content") or "")
-            title = normalize_title(title)
+        page = data.get("page")
+        page_content = (page or {}).get("content", "") if isinstance(page, dict) else ""
+        title = normalize_title(extract_title_from_html(page_content)) if page_content else None
+        links_extracted = int((page or {}).get("links_extracted", 0)) if isinstance(page, dict) else 0
 
         return RunResult(
             tool="spider-server",
             url=target_url,
             ok=True,
             duration_s=elapsed,
-            bytes_extracted=len(combined_content.encode("utf-8")),
-            link_count=sum(int(p.get("links_extracted", 0)) for p in pages),
+            bytes_extracted=len(page_content.encode("utf-8")),
+            link_count=links_extracted,
             title=title,
         )
     except Exception as exc:

@@ -30,6 +30,65 @@ Response:
 {"status":"ok"}
 ```
 
+### Scrape (single page)
+
+`POST /scrape`
+
+Fetches a single target page and returns one `page` object. This endpoint is intended for
+single-page extraction and benchmark parity with one-shot scrapers.
+
+Example:
+
+```bash
+curl -s -X POST http://localhost:8080/scrape \
+  -H 'content-type: application/json' \
+  -d '{
+    "url": "https://spider.cloud",
+    "request_timeout_secs": 10,
+    "crawl_timeout_secs": 30,
+    "respect_robots_txt": true,
+    "include_content": true,
+    "max_content_chars": 4000,
+    "crawl_mode": "http"
+  }'
+```
+
+Request fields:
+
+- `url` (required): absolute `http://` or `https://` URL
+- `request_timeout_secs` (optional)
+- `crawl_timeout_secs` (optional)
+- `respect_robots_txt` (optional, default true)
+- `include_content` (optional, default true)
+- `max_content_chars` (optional)
+- `proxies` (optional): list of `http://`, `https://`, `socks5://`, or `socks5h://` proxies
+- `anti_bot_profile` (optional): `off`, `basic`, or `camoufox_like`
+- `user_agent` (optional): override User-Agent
+- `referer` (optional): set Referer header
+- `redirect_policy` (optional): `loose`, `strict`, `none`
+- `redirect_limit` (optional): max redirects
+- `crawl_mode` (optional): `http`, `browser`, `auto`
+- `browser` (optional): same browser options as `/crawl`
+
+Response (shape):
+
+```json
+{
+  "root_url": "https://spider.cloud",
+  "scrape_duration_ms": 321,
+  "mode_used": "http",
+  "page": {
+    "url": "https://spider.cloud",
+    "final_url": "https://spider.cloud/",
+    "status_code": 200,
+    "bytes": 42137,
+    "links_extracted": 14,
+    "error": null,
+    "content": "<!doctype html>..."
+  }
+}
+```
+
 ### Crawl
 
 `POST /crawl`
@@ -206,7 +265,7 @@ The crawl API now supports explicit mode selection:
 
 New request fields:
 
-- `crawl_mode` (`http | browser | auto`)
+- `crawl_mode` (`http | browser | auto`) for both `/crawl` and `/scrape`
 - `auto_browser_min_pages` (default: `1`)
 - `auto_browser_min_links` (default: `20`)
 - `browser` (optional object):
@@ -236,6 +295,11 @@ Example auto mode payload:
   }
 }
 ```
+
+### Single-page auto fallback
+
+`/scrape` also supports `crawl_mode: "auto"`. It first attempts HTTP mode and falls back to
+browser mode when the single-page result is missing, non-2xx, or empty.
 
 ### Camoufox note
 
