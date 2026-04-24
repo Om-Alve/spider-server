@@ -60,7 +60,64 @@ def canonical_title_from_requests(url: str, timeout_s: int = 30) -> str | None:
         return None
 
 
-def run_spider_server(base_url: str, target_url: str, timeout_s: int) -> RunResult:
+def normalize_proxy_entry(value: str) -> str | None:
+    entry = value.strip()
+    if not entry or entry.startswith("#"):
+        return None
+
+    if entry.startswith(("http://", "https://", "socks5://", "socks5h://")):
+        return entry
+
+    if "@" in entry and ":" in entry.split("@", 1)[1]:
+        return f"http://{entry}"
+
+    parts = entry.split(":")
+    if len(parts) == 4:
+        host, port, user, password = parts
+        if host and port and user and password:
+            return f"http://{user}:{password}@{host}:{port}"
+    if len(parts) == 2:
+        host, port = parts
+        if host and port:
+            return f"http://{host}:{port}"
+
+    return None
+
+
+def load_spider_proxies(
+    proxy_list_url: str | None,
+    proxy_file: str | None,
+    timeout_s: int,
+    max_items: int,
+) -> list[str]:
+    entries: list[str] = []
+
+    if proxy_file:
+        entries.extend(Path(proxy_file).read_text().splitlines())
+    if proxy_list_url:
+        response = requests.get(proxy_list_url, timeout=timeout_s)
+        response.raise_for_status()
+        entries.extend(response.text.splitlines())
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in entries:
+        proxy = normalize_proxy_entry(raw)
+        if not proxy or proxy in seen:
+            continue
+        seen.add(proxy)
+        normalized.append(proxy)
+        if len(normalized) >= max_items:
+            break
+    return normalized
+
+
+def run_spider_server(
+    base_url: str,
+    target_url: str,
+    timeout_s: int,
+    proxies: list[str] | None = None,
+) -> RunResult:
     payload = {
         "url": target_url,
         "request_timeout_secs": min(10, timeout_s),
@@ -69,7 +126,11 @@ def run_spider_server(base_url: str, target_url: str, timeout_s: int) -> RunResu
         "include_content": True,
         "max_content_chars": 20_000,
         "crawl_mode": "http",
+        "anti_bot_profile": "camoufox_like",
+        "response_format": "html",
     }
+    if proxies:
+        payload["proxies"] = proxies
 
     start = time.perf_counter()
     try:
@@ -261,13 +322,22 @@ def ensure_spider_server(
 
 
 def run_sync_tool_batch(
-    tool: str, urls: list[str], iterations: int, timeout_s: int, server_url: str
+    tool: str,
+    urls: list[str],
+    iterations: int,
+    timeout_s: int,
+    server_url: str,
+    spider_proxies: list[str] | None = None,
 ) -> list[RunResult]:
     results: list[RunResult] = []
     for _ in range(iterations):
         for url in urls:
             if tool == "spider-server":
-                results.append(run_spider_server(server_url, url, timeout_s))
+                results.append(
+                    run_spider_server(
+                        server_url, url, timeout_s, proxies=spider_proxies
+                    )
+                )
             elif tool == "firecrawl":
                 results.append(run_firecrawl(url, timeout_s))
             else:
@@ -411,6 +481,28 @@ def parse_args() -> argparse.Namespace:
         default="spider-server,crawl4ai,firecrawl",
         help="Comma-separated tools to run",
     )
+    parser.add_argument(
+        "--spider-proxy-list-url",
+        default=os.getenv("SPIDER_PROXY_LIST_URL"),
+        help="Optional proxy list URL (newline-separated entries) for spider-server",
+    )
+    parser.add_argument(
+        "--spider-proxy-file",
+        default=None,
+        help="Optional local proxy file for spider-server",
+    )
+    parser.add_argument(
+        "--spider-proxy-timeout",
+        type=int,
+        default=20,
+        help="Timeout (seconds) for downloading proxy list URL",
+    )
+    parser.add_argument(
+        "--spider-proxy-max",
+        type=int,
+        default=120,
+        help="Max proxy entries to pass to spider-server",
+    )
     return parser.parse_args()
 
 
@@ -421,6 +513,16 @@ def main() -> int:
     tools = [item.strip() for item in args.tools.split(",") if item.strip()]
 
     canonical_titles = {url: canonical_title_from_requests(url) for url in urls}
+    spider_proxies: list[str] | None = None
+    if "spider-server" in tools:
+        spider_proxies = load_spider_proxies(
+            proxy_list_url=args.spider_proxy_list_url,
+            proxy_file=args.spider_proxy_file,
+            timeout_s=args.spider_proxy_timeout,
+            max_items=args.spider_proxy_max,
+        )
+        if spider_proxies:
+            print(f"Loaded {len(spider_proxies)} proxies for spider-server")
 
     server_process = None
     if "spider-server" in tools and not args.skip_server_start:
@@ -436,7 +538,12 @@ def main() -> int:
             else:
                 results.extend(
                     run_sync_tool_batch(
-                        tool, urls, args.iterations, args.timeout, args.server_url
+                        tool,
+                        urls,
+                        args.iterations,
+                        args.timeout,
+                        args.server_url,
+                        spider_proxies=spider_proxies,
                     )
                 )
     finally:

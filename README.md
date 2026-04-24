@@ -69,6 +69,7 @@ Request fields:
 - `redirect_limit` (optional): max redirects
 - `crawl_mode` (optional): `http`, `browser`, `auto`
 - `browser` (optional): same browser options as `/crawl`
+- `response_format` (optional): `html` or `text` (default: `text`)
 
 Response (shape):
 
@@ -305,6 +306,37 @@ browser mode when the single-page result is missing, non-2xx, or empty.
 
 This service provides a `camoufox_like` profile for anti-bot posture in HTTP mode
 (realistic Firefox-style user-agent + browser-like header behavior).
+
+## Benchmarks with rotating proxies
+
+The benchmark harness supports injecting a proxy list from either a direct URL or a local file.
+This is useful for evaluating success/quality under geo/rate-limit pressure.
+
+Supported flags (in `scripts/benchmarks/benchmark.py`):
+
+- `--proxy-list-url` (or env `BENCHMARK_PROXY_LIST_URL`)
+- `--proxy-list-file` (or env `BENCHMARK_PROXY_LIST_FILE`)
+- `--proxy-limit` (default: `50`)
+
+Example:
+
+```bash
+python3 scripts/benchmarks/benchmark.py \
+  --tools spider-server,crawl4ai \
+  --iterations 3 \
+  --timeout 30 \
+  --skip-server-start \
+  --proxy-list-url "https://proxy.webshare.io/.../download/..." \
+  --proxy-limit 40 \
+  --output scripts/benchmarks/results.json
+```
+
+Notes:
+
+- Proxy list parsing accepts plain `host:port` lines and authenticated forms such as
+  `username:password@host:port` or `host:port:username:password`.
+- The harness normalizes entries to `http://...` before sending them to `/scrape`.
+- For scrape quality scoring, the benchmark now requests `response_format: "html"` explicitly.
 
 If you need full Camoufox runtime integration, run a Camoufox-backed browser endpoint
 and provide it through `browser.chrome_connection_url`, or add a dedicated Camoufox
