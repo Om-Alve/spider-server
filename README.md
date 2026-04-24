@@ -1,1 +1,147 @@
 # spider-server
+
+A high-performance HTTP crawl service built with [spider](https://github.com/spider-rs/spider), `axum`, and Tokio.
+
+It exposes a JSON API for running bounded, concurrent crawls and is packaged with Docker for deployment.
+
+## Features
+
+- High-throughput async HTTP server (`axum` + Tokio)
+- Crawl endpoint backed by `spider` (HTTP crawling path)
+- Built-in server backpressure and safety limits:
+  - global HTTP request concurrency limit
+  - max in-flight crawl jobs limit
+  - request body size limit
+  - clamped crawl parameters (depth/pages/timeouts/concurrency/content)
+- Optional per-page content extraction with truncation
+- Container-friendly deployment via multi-stage Docker build and Docker Compose
+
+## API
+
+### Health check
+
+```bash
+curl -s http://localhost:8080/healthz
+```
+
+Response:
+
+```json
+{"status":"ok"}
+```
+
+### Crawl
+
+`POST /crawl`
+
+Example:
+
+```bash
+curl -s -X POST http://localhost:8080/crawl \
+  -H 'content-type: application/json' \
+  -d '{
+    "url": "https://spider.cloud",
+    "max_depth": 2,
+    "max_pages": 50,
+    "crawl_concurrency": 16,
+    "request_timeout_secs": 10,
+    "crawl_timeout_secs": 30,
+    "respect_robots_txt": true,
+    "subdomains": false,
+    "include_content": false,
+    "max_content_chars": 4000
+  }'
+```
+
+Request fields:
+
+- `url` (required): absolute `http://` or `https://` URL
+- `max_depth` (optional)
+- `max_pages` (optional)
+- `crawl_concurrency` (optional)
+- `request_timeout_secs` (optional)
+- `crawl_timeout_secs` (optional)
+- `respect_robots_txt` (optional, default true)
+- `subdomains` (optional, default false)
+- `include_content` (optional, default false)
+- `max_content_chars` (optional)
+
+Response (shape):
+
+```json
+{
+  "root_url": "https://spider.cloud",
+  "crawl_duration_ms": 1234,
+  "pages_fetched": 20,
+  "unique_links_seen": 58,
+  "pages": [
+    {
+      "url": "https://spider.cloud",
+      "final_url": "https://spider.cloud/",
+      "status_code": 200,
+      "bytes": 42137,
+      "links_extracted": 14,
+      "error": null,
+      "content": null
+    }
+  ]
+}
+```
+
+If crawler capacity is exhausted, the API returns `429 Too Many Requests`.
+
+## Local development
+
+```bash
+cargo run
+```
+
+Server listens on `0.0.0.0:8080` by default.
+
+## Configuration
+
+Environment variables:
+
+- `HOST` (default: `0.0.0.0`)
+- `PORT` (default: `8080`)
+- `HTTP_CONCURRENCY_LIMIT` (default: `1024`)
+- `MAX_CONCURRENT_CRAWLS` (default: available CPU parallelism)
+- `REQUEST_BODY_LIMIT_MB` (default: `2`)
+- `DEFAULT_MAX_DEPTH` (default: `2`)
+- `MAX_ALLOWED_DEPTH` (default: `6`)
+- `DEFAULT_MAX_PAGES` (default: `100`)
+- `MAX_ALLOWED_PAGES` (default: `5000`)
+- `DEFAULT_CRAWL_CONCURRENCY` (default: `16`)
+- `MAX_ALLOWED_CRAWL_CONCURRENCY` (default: `256`)
+- `DEFAULT_REQUEST_TIMEOUT_SECS` (default: `10`)
+- `MAX_REQUEST_TIMEOUT_SECS` (default: `60`)
+- `DEFAULT_CRAWL_TIMEOUT_SECS` (default: `30`)
+- `MAX_CRAWL_TIMEOUT_SECS` (default: `300`)
+- `DEFAULT_CONTENT_CHARS` (default: `4000`)
+- `MAX_CONTENT_CHARS` (default: `100000`)
+
+## Docker
+
+Build image:
+
+```bash
+docker build -t spider-server:latest .
+```
+
+Run container:
+
+```bash
+docker run --rm -p 8080:8080 spider-server:latest
+```
+
+### Docker Compose
+
+```bash
+docker compose up --build -d
+```
+
+## Notes on performance
+
+- `spider` performs async crawling internally; tune `crawl_concurrency` and page/depth limits to fit your target.
+- Protect upstream sites and your own infra by respecting robots and keeping hard bounds enabled.
+- For production, place this service behind a reverse proxy/load balancer and tune process CPU/memory limits.
