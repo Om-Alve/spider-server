@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{io::Cursor, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     extract::State,
@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use spider::configuration::RedirectPolicy;
 use spider::features::chrome_common::RequestInterceptConfiguration;
@@ -92,6 +93,7 @@ struct ScrapeRequest {
     redirect_limit: Option<usize>,
     crawl_mode: Option<CrawlMode>,
     browser: Option<BrowserModeConfig>,
+    response_format: Option<ScrapeResponseFormat>,
 }
 
 #[derive(Debug, Serialize)]
@@ -168,6 +170,13 @@ enum CrawlMode {
     Http,
     Browser,
     Auto,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ScrapeResponseFormat {
+    Html,
+    Text,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -467,6 +476,7 @@ async fn crawl_once(state: &AppState, payload: CrawlRequest) -> Result<CrawlResp
                 &recovered_page,
                 include_content,
                 max_content_chars,
+                None,
             )],
         });
     }
@@ -477,7 +487,7 @@ async fn crawl_once(state: &AppState, payload: CrawlRequest) -> Result<CrawlResp
         .map(|spider_pages| {
             spider_pages
                 .iter()
-                .map(|page| map_page(page, include_content, max_content_chars))
+                .map(|page| map_page(page, include_content, max_content_chars, None))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -522,6 +532,9 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
         state.config.max_content_chars,
     );
     let include_content = payload.include_content.unwrap_or(true);
+    let response_format = payload
+        .response_format
+        .unwrap_or(ScrapeResponseFormat::Text);
     let redirect_limit = payload.redirect_limit.unwrap_or(10);
     let crawl_mode = payload.crawl_mode.clone().unwrap_or(CrawlMode::Http);
     let proxies = normalize_proxies(payload.proxies, state.config.max_proxies_per_request)?;
@@ -552,7 +565,9 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
     }
     apply_anti_bot_profile(
         &mut website,
-        payload.anti_bot_profile.unwrap_or(AntiBotProfile::Basic),
+        payload
+            .anti_bot_profile
+            .unwrap_or(AntiBotProfile::CamoufoxLike),
     );
     configure_browser_mode(&mut website, payload.browser.as_ref(), &crawl_mode);
 
@@ -582,17 +597,37 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
         mode_used,
         page: page
             .as_ref()
-            .map(|value| map_page(value, include_content, max_content_chars)),
+            .map(|value| {
+                map_page(
+                    value,
+                    include_content,
+                    max_content_chars,
+                    Some(&response_format),
+                )
+            }),
     })
 }
 
-fn map_page(page: &Page, include_content: bool, max_content_chars: usize) -> CrawledPage {
+fn map_page(
+    page: &Page,
+    include_content: bool,
+    max_content_chars: usize,
+    response_format: Option<&ScrapeResponseFormat>,
+) -> CrawledPage {
     let html = include_content.then(|| page.get_html());
-    let content = html
-        .as_ref()
-        .map(|value| value.chars().take(max_content_chars).collect::<String>());
+    let content = html.as_ref().map(|value| {
+        let rendered = match response_format.unwrap_or(&ScrapeResponseFormat::Html) {
+            ScrapeResponseFormat::Html => value.to_string(),
+            ScrapeResponseFormat::Text => html_to_text(value),
+        };
+        rendered.chars().take(max_content_chars).collect::<String>()
+    });
 
     let error = page.error_status.as_ref().map(ToString::to_string);
+    let links_extracted = page.page_links.as_ref().map_or_else(
+        || count_links_from_html(&page.get_html()),
+        |links| links.len(),
+    );
 
     CrawledPage {
         url: page.get_url().to_owned(),
@@ -602,7 +637,7 @@ fn map_page(page: &Page, include_content: bool, max_content_chars: usize) -> Cra
             || page.get_bytes().map_or(0, |bytes| bytes.len()),
             |value| value.len(),
         ),
-        links_extracted: page.page_links.as_ref().map_or(0, |links| links.len()),
+        links_extracted,
         error,
         content,
     }
@@ -774,6 +809,19 @@ fn should_fallback_to_browser_page(page: Option<&Page>, require_content: bool) -
         return true;
     }
     require_content && page.get_html().trim().is_empty()
+}
+
+fn html_to_text(html: &str) -> String {
+    let width = 120;
+    html2text::from_read(Cursor::new(html.as_bytes()), width).unwrap_or_else(|_| html.to_string())
+}
+
+fn count_links_from_html(html: &str) -> usize {
+    let parsed = Html::parse_document(html);
+    let Ok(selector) = Selector::parse("a[href]") else {
+        return 0;
+    };
+    parsed.select(&selector).count()
 }
 
 fn urls_match(a: &str, b: &str) -> bool {
