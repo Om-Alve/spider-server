@@ -8,6 +8,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use spider::configuration::RedirectPolicy;
 use spider::website::Website;
 use tokio::{net::TcpListener, sync::Semaphore, time::Instant};
 use tower::{limit::ConcurrencyLimitLayer, ServiceBuilder};
@@ -35,6 +36,9 @@ struct ServerConfig {
     max_crawl_timeout_secs: u64,
     default_content_chars: usize,
     max_content_chars: usize,
+    default_batch_size: usize,
+    max_batch_size: usize,
+    max_proxies_per_request: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +53,12 @@ struct CrawlRequest {
     subdomains: Option<bool>,
     include_content: Option<bool>,
     max_content_chars: Option<usize>,
+    proxies: Option<Vec<String>>,
+    anti_bot_profile: Option<AntiBotProfile>,
+    user_agent: Option<String>,
+    referer: Option<String>,
+    redirect_policy: Option<RedirectPolicyRequest>,
+    redirect_limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,6 +68,24 @@ struct CrawlResponse {
     pages_fetched: usize,
     unique_links_seen: usize,
     pages: Vec<CrawledPage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchCrawlRequest {
+    requests: Vec<CrawlRequest>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchCrawlResponse {
+    batch_duration_ms: u64,
+    results: Vec<BatchCrawlItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchCrawlItem {
+    ok: bool,
+    response: Option<CrawlResponse>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +112,32 @@ struct ErrorResponse {
 struct ApiError {
     status: StatusCode,
     message: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AntiBotProfile {
+    Off,
+    Basic,
+    CamoufoxLike,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RedirectPolicyRequest {
+    Loose,
+    Strict,
+    None,
+}
+
+impl From<RedirectPolicyRequest> for RedirectPolicy {
+    fn from(value: RedirectPolicyRequest) -> Self {
+        match value {
+            RedirectPolicyRequest::Loose => RedirectPolicy::Loose,
+            RedirectPolicyRequest::Strict => RedirectPolicy::Strict,
+            RedirectPolicyRequest::None => RedirectPolicy::None,
+        }
+    }
 }
 
 impl ApiError {
@@ -148,6 +202,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_crawl_timeout_secs: read_env_parse("MAX_CRAWL_TIMEOUT_SECS", 300),
             default_content_chars: read_env_parse("DEFAULT_CONTENT_CHARS", 4000),
             max_content_chars: read_env_parse("MAX_CONTENT_CHARS", 100_000),
+            default_batch_size: read_env_parse("DEFAULT_BATCH_SIZE", 4),
+            max_batch_size: read_env_parse("MAX_BATCH_SIZE", 64),
+            max_proxies_per_request: read_env_parse("MAX_PROXIES_PER_REQUEST", 128),
         }),
         crawl_permits: Arc::new(Semaphore::new(max_concurrent_crawls)),
     };
@@ -155,6 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/crawl", post(crawl))
+        .route("/crawl/batch", post(crawl_batch))
         .with_state(state)
         .layer(
             ServiceBuilder::new()
@@ -182,6 +240,59 @@ async fn crawl(
     State(state): State<AppState>,
     Json(payload): Json<CrawlRequest>,
 ) -> Result<Json<CrawlResponse>, ApiError> {
+    let response = crawl_once(&state, payload).await?;
+    Ok(Json(response))
+}
+
+async fn crawl_batch(
+    State(state): State<AppState>,
+    Json(payload): Json<BatchCrawlRequest>,
+) -> Result<Json<BatchCrawlResponse>, ApiError> {
+    if payload.requests.is_empty() {
+        return Err(ApiError::bad_request(
+            "requests must contain at least one item",
+        ));
+    }
+
+    let batch_size = clamp(
+        payload.requests.len(),
+        1,
+        state
+            .config
+            .max_batch_size
+            .max(state.config.default_batch_size),
+    );
+    if payload.requests.len() > batch_size {
+        return Err(ApiError::bad_request(format!(
+            "batch size exceeds configured maximum: {}",
+            state.config.max_batch_size
+        )));
+    }
+
+    let start = Instant::now();
+    let mut results = Vec::with_capacity(payload.requests.len());
+    for item in payload.requests {
+        match crawl_once(&state, item).await {
+            Ok(response) => results.push(BatchCrawlItem {
+                ok: true,
+                response: Some(response),
+                error: None,
+            }),
+            Err(err) => results.push(BatchCrawlItem {
+                ok: false,
+                response: None,
+                error: Some(err.message),
+            }),
+        }
+    }
+
+    Ok(Json(BatchCrawlResponse {
+        batch_duration_ms: start.elapsed().as_millis() as u64,
+        results,
+    }))
+}
+
+async fn crawl_once(state: &AppState, payload: CrawlRequest) -> Result<CrawlResponse, ApiError> {
     validate_target_url(&payload.url)?;
 
     let _permit = state
@@ -229,6 +340,8 @@ async fn crawl(
         state.config.max_content_chars,
     );
     let include_content = payload.include_content.unwrap_or(false);
+    let redirect_limit = payload.redirect_limit.unwrap_or(10);
+    let proxies = normalize_proxies(payload.proxies, state.config.max_proxies_per_request)?;
 
     let mut website = Website::new(&payload.url);
     website
@@ -239,7 +352,25 @@ async fn crawl(
         .with_crawl_timeout(Some(Duration::from_secs(crawl_timeout_secs)))
         .with_respect_robots_txt(payload.respect_robots_txt.unwrap_or(true))
         .with_subdomains(payload.subdomains.unwrap_or(false))
+        .with_redirect_limit(redirect_limit)
         .with_return_page_links(true);
+
+    if let Some(policy) = payload.redirect_policy {
+        website.with_redirect_policy(policy.into());
+    }
+    if let Some(proxy_list) = proxies {
+        website.with_proxies(Some(proxy_list));
+    }
+    if let Some(user_agent) = payload.user_agent.as_deref() {
+        website.with_user_agent(Some(user_agent));
+    }
+    if let Some(referer) = payload.referer {
+        website.with_referer(Some(referer));
+    }
+    apply_anti_bot_profile(
+        &mut website,
+        payload.anti_bot_profile.unwrap_or(AntiBotProfile::Basic),
+    );
 
     let start = Instant::now();
     // Use scrape_raw so page bodies are retained for API quality comparisons.
@@ -276,13 +407,74 @@ async fn crawl(
         })
         .unwrap_or_default();
 
-    Ok(Json(CrawlResponse {
+    Ok(CrawlResponse {
         root_url: payload.url,
         crawl_duration_ms: elapsed_ms,
         pages_fetched: pages.len(),
         unique_links_seen: website.get_links().len(),
         pages,
-    }))
+    })
+}
+
+fn normalize_proxies(
+    proxies: Option<Vec<String>>,
+    max_proxies: usize,
+) -> Result<Option<Vec<String>>, ApiError> {
+    let Some(list) = proxies else {
+        return Ok(None);
+    };
+
+    let mut normalized = Vec::with_capacity(list.len());
+    for proxy in list {
+        let value = proxy.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if !(value.starts_with("http://")
+            || value.starts_with("https://")
+            || value.starts_with("socks5://")
+            || value.starts_with("socks5h://"))
+        {
+            return Err(ApiError::bad_request(
+                "proxy entries must use http://, https://, socks5://, or socks5h://",
+            ));
+        }
+        normalized.push(value.to_string());
+    }
+
+    if normalized.len() > max_proxies {
+        return Err(ApiError::bad_request(format!(
+            "proxy list exceeds configured maximum: {}",
+            max_proxies
+        )));
+    }
+
+    Ok((!normalized.is_empty()).then_some(normalized))
+}
+
+fn apply_anti_bot_profile(website: &mut Website, profile: AntiBotProfile) {
+    match profile {
+        AntiBotProfile::Off => {
+            website
+                .with_modify_headers(false)
+                .with_modify_http_client_headers(false);
+        }
+        AntiBotProfile::Basic => {
+            website
+                .with_modify_headers(true)
+                .with_modify_http_client_headers(true);
+        }
+        AntiBotProfile::CamoufoxLike => {
+            // HTTP-mode approximation of camoufox-style evasive posture.
+            website
+                .with_modify_headers(true)
+                .with_modify_http_client_headers(true)
+                .with_user_agent(Some(
+                    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+                ))
+                .with_referer(Some("https://www.google.com/".to_string()));
+        }
+    }
 }
 
 fn read_env(name: &str, default: &str) -> String {
