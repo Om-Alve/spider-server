@@ -227,6 +227,36 @@ Environment variables:
 - `DEFAULT_BATCH_SIZE` (default: `4`)
 - `MAX_BATCH_SIZE` (default: `64`)
 - `MAX_PROXIES_PER_REQUEST` (default: `128`)
+- `PROXY_FILE` (default: `proxy.txt`)
+- `PROXY_FILE_MAX_ENTRIES` (default: `5000`)
+- `PROXY_FILE_DEFAULT_SCHEME` (default: `http`)
+
+### Automatic proxy rotation from `proxy.txt`
+
+You can drop a `proxy.txt` file in the project root (or set `PROXY_FILE` to another path),
+and the server will automatically use those proxies for rotation when a request does not include
+its own `proxies` list.
+
+Supported line formats:
+
+- `host:port`
+- `username:password@host:port`
+- `host:port:username:password`
+- full URLs like `http://user:pass@host:port`, `socks5://host:port`
+
+Example:
+
+```txt
+gate.smartproxy.com:7000:my-user:my-pass
+username:password@us.proxy.example:8080
+1.2.3.4:3128
+```
+
+Notes:
+
+- The file is loaded at startup.
+- If a request explicitly sets `proxies`, that request-specific list takes precedence.
+- If the file is missing or empty, behavior is unchanged (no default proxy rotation).
 
 ## Docker
 

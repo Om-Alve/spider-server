@@ -1,4 +1,13 @@
-use std::{io::Cursor, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    fs,
+    io::Cursor,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use axum::{
     extract::State,
@@ -16,13 +25,14 @@ use spider::website::Website;
 use tokio::{net::TcpListener, sync::Semaphore, time::Instant};
 use tower::{limit::ConcurrencyLimitLayer, ServiceBuilder};
 use tower_http::{compression::CompressionLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 
 #[derive(Clone)]
 struct AppState {
     config: Arc<ServerConfig>,
     crawl_permits: Arc<Semaphore>,
+    proxy_rotation_cursor: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -42,6 +52,7 @@ struct ServerConfig {
     default_batch_size: usize,
     max_batch_size: usize,
     max_proxies_per_request: usize,
+    default_proxies: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,6 +251,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = read_env_parse("PORT", 8080_u16);
     let request_body_limit_mb = read_env_parse("REQUEST_BODY_LIMIT_MB", 2_usize);
     let http_concurrency_limit = read_env_parse("HTTP_CONCURRENCY_LIMIT", 1024_usize);
+    let proxy_file = std::env::var("DEFAULT_PROXY_FILE")
+        .or_else(|_| std::env::var("PROXY_FILE"))
+        .unwrap_or_else(|_| "proxy.txt".to_string());
+    let proxy_file_max_entries = read_env_parse("PROXY_FILE_MAX_ENTRIES", 5_000_usize);
+    let proxy_file_default_scheme = read_env("PROXY_FILE_DEFAULT_SCHEME", "http");
+    let default_proxies = load_proxies_from_file(
+        &proxy_file,
+        proxy_file_max_entries,
+        &proxy_file_default_scheme,
+    );
     let max_concurrent_crawls = read_env_parse(
         "MAX_CONCURRENT_CRAWLS",
         std::thread::available_parallelism()
@@ -264,9 +285,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             default_batch_size: read_env_parse("DEFAULT_BATCH_SIZE", 4),
             max_batch_size: read_env_parse("MAX_BATCH_SIZE", 64),
             max_proxies_per_request: read_env_parse("MAX_PROXIES_PER_REQUEST", 128),
+            default_proxies,
         }),
         crawl_permits: Arc::new(Semaphore::new(max_concurrent_crawls)),
+        proxy_rotation_cursor: Arc::new(AtomicUsize::new(0)),
     };
+
+    if state.config.default_proxies.is_empty() {
+        info!("no rotating proxies loaded from {}", proxy_file);
+    } else {
+        info!(
+            "loaded {} rotating proxies from {}",
+            state.config.default_proxies.len(),
+            proxy_file
+        );
+    }
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -420,7 +453,7 @@ async fn crawl_once(state: &AppState, payload: CrawlRequest) -> Result<CrawlResp
     );
     let include_content = payload.include_content.unwrap_or(false);
     let redirect_limit = payload.redirect_limit.unwrap_or(10);
-    let proxies = normalize_proxies(payload.proxies, state.config.max_proxies_per_request)?;
+    let proxies = resolve_request_proxies(payload.proxies, state)?;
     let crawl_mode = payload.crawl_mode.clone().unwrap_or(CrawlMode::Http);
     let auto_min_pages = payload.auto_browser_min_pages.unwrap_or(1);
     let auto_min_links = payload.auto_browser_min_links.unwrap_or(20);
@@ -537,7 +570,7 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
         .unwrap_or(ScrapeResponseFormat::Text);
     let redirect_limit = payload.redirect_limit.unwrap_or(10);
     let crawl_mode = payload.crawl_mode.clone().unwrap_or(CrawlMode::Http);
-    let proxies = normalize_proxies(payload.proxies, state.config.max_proxies_per_request)?;
+    let proxies = resolve_request_proxies(payload.proxies, state)?;
 
     let mut website = Website::new(&payload.url);
     website
@@ -595,16 +628,14 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
         root_url: payload.url,
         scrape_duration_ms: elapsed_ms,
         mode_used,
-        page: page
-            .as_ref()
-            .map(|value| {
-                map_page(
-                    value,
-                    include_content,
-                    max_content_chars,
-                    Some(&response_format),
-                )
-            }),
+        page: page.as_ref().map(|value| {
+            map_page(
+                value,
+                include_content,
+                max_content_chars,
+                Some(&response_format),
+            )
+        }),
     })
 }
 
@@ -868,6 +899,116 @@ fn normalize_proxies(
     }
 
     Ok((!normalized.is_empty()).then_some(normalized))
+}
+
+fn resolve_request_proxies(
+    request_proxies: Option<Vec<String>>,
+    state: &AppState,
+) -> Result<Option<Vec<String>>, ApiError> {
+    if request_proxies.is_some() {
+        return normalize_proxies(request_proxies, state.config.max_proxies_per_request);
+    }
+
+    if state.config.default_proxies.is_empty() {
+        return Ok(None);
+    }
+
+    let defaults = &state.config.default_proxies;
+    let count = state.config.max_proxies_per_request.min(defaults.len());
+    let offset = state.proxy_rotation_cursor.fetch_add(1, Ordering::Relaxed) % defaults.len();
+
+    let rotated = (0..count)
+        .map(|idx| defaults[(offset + idx) % defaults.len()].clone())
+        .collect::<Vec<_>>();
+
+    Ok(Some(rotated))
+}
+
+fn load_proxies_from_file(path: &str, max_entries: usize, default_scheme: &str) -> Vec<String> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!("failed reading proxy file '{}': {}", path, err);
+            }
+            return Vec::new();
+        }
+    };
+
+    let mut proxies = Vec::new();
+    for (line_idx, line) in content.lines().enumerate() {
+        if proxies.len() >= max_entries {
+            break;
+        }
+
+        match normalize_single_proxy(line, default_scheme) {
+            Ok(Some(proxy)) => proxies.push(proxy),
+            Ok(None) => {}
+            Err(err) => {
+                warn!(
+                    "ignoring invalid proxy at {}:{} ({})",
+                    path,
+                    line_idx + 1,
+                    err.message
+                );
+            }
+        }
+    }
+
+    proxies
+}
+
+fn normalize_single_proxy(value: &str, default_scheme: &str) -> Result<Option<String>, ApiError> {
+    let value = value.trim();
+    if value.is_empty() || value.starts_with('#') {
+        return Ok(None);
+    }
+
+    if value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("socks5://")
+        || value.starts_with("socks5h://")
+    {
+        return Ok(Some(value.to_string()));
+    }
+
+    if value.contains("://") {
+        return Err(ApiError::bad_request(
+            "proxy entries must use http://, https://, socks5://, or socks5h://",
+        ));
+    }
+
+    let scheme = match default_scheme.trim().to_ascii_lowercase().as_str() {
+        "http" => "http",
+        "https" => "https",
+        "socks5" => "socks5",
+        "socks5h" => "socks5h",
+        _ => "http",
+    };
+
+    if !value.contains('@') && value.split(':').count() == 4 {
+        let mut parts = value.splitn(4, ':');
+        let host = parts.next().unwrap_or_default();
+        let port = parts.next().unwrap_or_default();
+        let username = parts.next().unwrap_or_default();
+        let password = parts.next().unwrap_or_default();
+        if host.is_empty() || port.is_empty() || username.is_empty() || password.is_empty() {
+            return Err(ApiError::bad_request(
+                "proxy entries must include host and port",
+            ));
+        }
+        return Ok(Some(format!(
+            "{scheme}://{username}:{password}@{host}:{port}"
+        )));
+    }
+
+    if value.contains(':') {
+        return Ok(Some(format!("{scheme}://{value}")));
+    }
+
+    Err(ApiError::bad_request(
+        "proxy entries must include host:port",
+    ))
 }
 
 fn apply_anti_bot_profile(website: &mut Website, profile: AntiBotProfile) {
