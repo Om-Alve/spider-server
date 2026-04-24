@@ -11,9 +11,7 @@ use serde::{Deserialize, Serialize};
 use spider::website::Website;
 use tokio::{net::TcpListener, sync::Semaphore, time::Instant};
 use tower::{limit::ConcurrencyLimitLayer, ServiceBuilder};
-use tower_http::{
-    compression::CompressionLayer, limit::RequestBodyLimitLayer, trace::TraceLayer,
-};
+use tower_http::{compression::CompressionLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::info;
 use url::Url;
 
@@ -253,12 +251,10 @@ async fn crawl(
             spider_pages
                 .iter()
                 .map(|page| {
-                    let content = if include_content {
-                        let html = page.get_html();
-                        Some(html.chars().take(max_content_chars).collect::<String>())
-                    } else {
-                        None
-                    };
+                    let html = include_content.then(|| page.get_html());
+                    let content = html
+                        .as_ref()
+                        .map(|value| value.chars().take(max_content_chars).collect::<String>());
 
                     let error = page.error_status.as_ref().map(ToString::to_string);
 
@@ -266,7 +262,10 @@ async fn crawl(
                         url: page.get_url().to_owned(),
                         final_url: page.get_url_final().to_owned(),
                         status_code: page.status_code.as_u16(),
-                        bytes: page.size(),
+                        bytes: html.as_ref().map_or_else(
+                            || page.get_bytes().map_or(0, |bytes| bytes.len()),
+                            |value| value.len(),
+                        ),
                         links_extracted: page.page_links.as_ref().map_or(0, |links| links.len()),
                         error,
                         content,
