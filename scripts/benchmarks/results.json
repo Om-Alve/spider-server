@@ -1,0 +1,248 @@
+{
+  "meta": {
+    "iterations": 2,
+    "targets": [
+      "https://www.rust-lang.org",
+      "https://docs.rs",
+      "https://tokio.rs"
+    ],
+    "tools": [
+      "spider-server",
+      "crawl4ai",
+      "firecrawl"
+    ],
+    "generated_at_unix": 1777050196.401039
+  },
+  "canonical_titles": {
+    "https://www.rust-lang.org": "Rust Programming Language",
+    "https://docs.rs": "Docs.rs",
+    "https://tokio.rs": "Tokio - An asynchronous Rust runtime"
+  },
+  "summary": {
+    "spider-server": {
+      "runs": 6,
+      "successes": 6,
+      "avg_latency_s": 0.119,
+      "p95_latency_s": 0.2594,
+      "avg_bytes": 78510,
+      "avg_links": 166.33,
+      "title_match_rate": 1,
+      "content_presence_rate": 1,
+      "links_presence_rate": 1,
+      "errors": []
+    },
+    "crawl4ai": {
+      "runs": 6,
+      "successes": 6,
+      "avg_latency_s": 0.3199,
+      "p95_latency_s": 0.468,
+      "avg_bytes": 20086,
+      "avg_links": 31.67,
+      "title_match_rate": 1,
+      "content_presence_rate": 1,
+      "links_presence_rate": 1,
+      "errors": []
+    },
+    "firecrawl": {
+      "runs": 6,
+      "successes": 0,
+      "avg_latency_s": null,
+      "p95_latency_s": null,
+      "avg_bytes": 0,
+      "avg_links": 0.0,
+      "title_match_rate": null,
+      "content_presence_rate": null,
+      "links_presence_rate": null,
+      "errors": [
+        "FIRECRAWL_API_KEY not set",
+        "FIRECRAWL_API_KEY not set",
+        "FIRECRAWL_API_KEY not set",
+        "FIRECRAWL_API_KEY not set",
+        "FIRECRAWL_API_KEY not set",
+        "FIRECRAWL_API_KEY not set"
+      ]
+    }
+  },
+  "runs": [
+    {
+      "tool": "spider-server",
+      "url": "https://www.rust-lang.org",
+      "ok": true,
+      "duration_s": 0.10484806798922364,
+      "bytes_extracted": 110680,
+      "link_count": 223,
+      "title": "Rust Programming Language",
+      "error": null
+    },
+    {
+      "tool": "spider-server",
+      "url": "https://docs.rs",
+      "ok": true,
+      "duration_s": 0.24238702800357714,
+      "bytes_extracted": 64822,
+      "link_count": 149,
+      "title": "Docs.rs",
+      "error": null
+    },
+    {
+      "tool": "spider-server",
+      "url": "https://tokio.rs",
+      "ok": true,
+      "duration_s": 0.03299004399741534,
+      "bytes_extracted": 60030,
+      "link_count": 127,
+      "title": "Tokio - An asynchronous Rust runtime",
+      "error": null
+    },
+    {
+      "tool": "spider-server",
+      "url": "https://www.rust-lang.org",
+      "ok": true,
+      "duration_s": 0.08559419200173579,
+      "bytes_extracted": 110680,
+      "link_count": 223,
+      "title": "Rust Programming Language",
+      "error": null
+    },
+    {
+      "tool": "spider-server",
+      "url": "https://docs.rs",
+      "ok": true,
+      "duration_s": 0.21620175300631672,
+      "bytes_extracted": 64822,
+      "link_count": 149,
+      "title": "Docs.rs",
+      "error": null
+    },
+    {
+      "tool": "spider-server",
+      "url": "https://tokio.rs",
+      "ok": true,
+      "duration_s": 0.03185135700914543,
+      "bytes_extracted": 60030,
+      "link_count": 127,
+      "title": "Tokio - An asynchronous Rust runtime",
+      "error": null
+    },
+    {
+      "tool": "crawl4ai",
+      "url": "https://www.rust-lang.org",
+      "ok": true,
+      "duration_s": 0.4399250989954453,
+      "bytes_extracted": 18440,
+      "link_count": 32,
+      "title": "Rust Programming Language",
+      "error": null
+    },
+    {
+      "tool": "crawl4ai",
+      "url": "https://docs.rs",
+      "ok": true,
+      "duration_s": 0.39679203400737606,
+      "bytes_extracted": 16558,
+      "link_count": 33,
+      "title": "Docs.rs",
+      "error": null
+    },
+    {
+      "tool": "crawl4ai",
+      "url": "https://tokio.rs",
+      "ok": true,
+      "duration_s": 0.3256157480063848,
+      "bytes_extracted": 25262,
+      "link_count": 30,
+      "title": "Tokio - An asynchronous Rust runtime",
+      "error": null
+    },
+    {
+      "tool": "crawl4ai",
+      "url": "https://www.rust-lang.org",
+      "ok": true,
+      "duration_s": 0.24662017499213107,
+      "bytes_extracted": 18440,
+      "link_count": 32,
+      "title": "Rust Programming Language",
+      "error": null
+    },
+    {
+      "tool": "crawl4ai",
+      "url": "https://docs.rs",
+      "ok": true,
+      "duration_s": 0.21151514000666793,
+      "bytes_extracted": 16558,
+      "link_count": 33,
+      "title": "Docs.rs",
+      "error": null
+    },
+    {
+      "tool": "crawl4ai",
+      "url": "https://tokio.rs",
+      "ok": true,
+      "duration_s": 0.2992280379985459,
+      "bytes_extracted": 25262,
+      "link_count": 30,
+      "title": "Tokio - An asynchronous Rust runtime",
+      "error": null
+    },
+    {
+      "tool": "firecrawl",
+      "url": "https://www.rust-lang.org",
+      "ok": false,
+      "duration_s": 0.0,
+      "bytes_extracted": 0,
+      "link_count": 0,
+      "title": null,
+      "error": "FIRECRAWL_API_KEY not set"
+    },
+    {
+      "tool": "firecrawl",
+      "url": "https://docs.rs",
+      "ok": false,
+      "duration_s": 0.0,
+      "bytes_extracted": 0,
+      "link_count": 0,
+      "title": null,
+      "error": "FIRECRAWL_API_KEY not set"
+    },
+    {
+      "tool": "firecrawl",
+      "url": "https://tokio.rs",
+      "ok": false,
+      "duration_s": 0.0,
+      "bytes_extracted": 0,
+      "link_count": 0,
+      "title": null,
+      "error": "FIRECRAWL_API_KEY not set"
+    },
+    {
+      "tool": "firecrawl",
+      "url": "https://www.rust-lang.org",
+      "ok": false,
+      "duration_s": 0.0,
+      "bytes_extracted": 0,
+      "link_count": 0,
+      "title": null,
+      "error": "FIRECRAWL_API_KEY not set"
+    },
+    {
+      "tool": "firecrawl",
+      "url": "https://docs.rs",
+      "ok": false,
+      "duration_s": 0.0,
+      "bytes_extracted": 0,
+      "link_count": 0,
+      "title": null,
+      "error": "FIRECRAWL_API_KEY not set"
+    },
+    {
+      "tool": "firecrawl",
+      "url": "https://tokio.rs",
+      "ok": false,
+      "duration_s": 0.0,
+      "bytes_extracted": 0,
+      "link_count": 0,
+      "title": null,
+      "error": "FIRECRAWL_API_KEY not set"
+    }
+  ]
+}
