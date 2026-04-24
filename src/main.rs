@@ -9,6 +9,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use spider::configuration::RedirectPolicy;
+use spider::features::chrome_common::RequestInterceptConfiguration;
 use spider::website::Website;
 use tokio::{net::TcpListener, sync::Semaphore, time::Instant};
 use tower::{limit::ConcurrencyLimitLayer, ServiceBuilder};
@@ -59,6 +60,10 @@ struct CrawlRequest {
     referer: Option<String>,
     redirect_policy: Option<RedirectPolicyRequest>,
     redirect_limit: Option<usize>,
+    crawl_mode: Option<CrawlMode>,
+    auto_browser_min_pages: Option<usize>,
+    auto_browser_min_links: Option<usize>,
+    browser: Option<BrowserModeConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -128,6 +133,24 @@ enum RedirectPolicyRequest {
     Loose,
     Strict,
     None,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CrawlMode {
+    Http,
+    Browser,
+    Auto,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct BrowserModeConfig {
+    chrome_connection_url: Option<String>,
+    chrome_intercept: Option<bool>,
+    block_visuals: Option<bool>,
+    block_stylesheets: Option<bool>,
+    block_javascript: Option<bool>,
+    block_analytics: Option<bool>,
 }
 
 impl From<RedirectPolicyRequest> for RedirectPolicy {
@@ -353,6 +376,9 @@ async fn crawl_once(state: &AppState, payload: CrawlRequest) -> Result<CrawlResp
     let include_content = payload.include_content.unwrap_or(false);
     let redirect_limit = payload.redirect_limit.unwrap_or(10);
     let proxies = normalize_proxies(payload.proxies, state.config.max_proxies_per_request)?;
+    let crawl_mode = payload.crawl_mode.clone().unwrap_or(CrawlMode::Http);
+    let auto_min_pages = payload.auto_browser_min_pages.unwrap_or(1);
+    let auto_min_links = payload.auto_browser_min_links.unwrap_or(20);
 
     let mut website = Website::new(&payload.url);
     website
@@ -382,10 +408,22 @@ async fn crawl_once(state: &AppState, payload: CrawlRequest) -> Result<CrawlResp
         &mut website,
         payload.anti_bot_profile.unwrap_or(AntiBotProfile::Basic),
     );
+    configure_browser_mode(&mut website, payload.browser.as_ref(), &crawl_mode);
 
     let start = Instant::now();
-    // Use scrape_raw so page bodies are retained for API quality comparisons.
-    website.scrape_raw().await;
+    run_crawl_mode(&mut website, &crawl_mode).await;
+    if matches!(crawl_mode, CrawlMode::Auto)
+        && should_fallback_to_browser(&website, auto_min_pages, auto_min_links)
+    {
+        let mut browser_website = website.clone();
+        configure_browser_mode(
+            &mut browser_website,
+            payload.browser.as_ref(),
+            &CrawlMode::Browser,
+        );
+        run_crawl_mode(&mut browser_website, &CrawlMode::Browser).await;
+        website = browser_website;
+    }
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     let pages = website
@@ -425,6 +463,55 @@ async fn crawl_once(state: &AppState, payload: CrawlRequest) -> Result<CrawlResp
         unique_links_seen: website.get_links().len(),
         pages,
     })
+}
+
+fn configure_browser_mode(
+    website: &mut Website,
+    browser: Option<&BrowserModeConfig>,
+    mode: &CrawlMode,
+) {
+    if !matches!(mode, CrawlMode::Browser | CrawlMode::Auto) {
+        return;
+    }
+
+    if let Some(config) = browser {
+        website.with_chrome_connection(config.chrome_connection_url.clone());
+
+        let mut intercept =
+            RequestInterceptConfiguration::new(config.chrome_intercept.unwrap_or(true));
+        if let Some(value) = config.block_visuals {
+            intercept.block_visuals = value;
+        }
+        if let Some(value) = config.block_stylesheets {
+            intercept.block_stylesheets = value;
+        }
+        if let Some(value) = config.block_javascript {
+            intercept.block_javascript = value;
+        }
+        if let Some(value) = config.block_analytics {
+            intercept.block_analytics = value;
+        }
+        website.with_chrome_intercept(intercept);
+    } else {
+        website.with_chrome_intercept(RequestInterceptConfiguration::new(true));
+    }
+}
+
+async fn run_crawl_mode(website: &mut Website, mode: &CrawlMode) {
+    match mode {
+        // scrape_raw keeps pages for API responses while remaining HTTP-first.
+        CrawlMode::Http => website.scrape_raw().await,
+        // crawl() executes browser path when chrome feature is enabled.
+        CrawlMode::Browser => website.scrape().await,
+        // auto starts in HTTP mode; optional browser fallback handled by caller.
+        CrawlMode::Auto => website.scrape_raw().await,
+    }
+}
+
+fn should_fallback_to_browser(website: &Website, min_pages: usize, min_links: usize) -> bool {
+    let pages = website.get_pages().map_or(0, Vec::len);
+    let links = website.get_links().len();
+    pages < min_pages || links < min_links
 }
 
 fn normalize_proxies(
