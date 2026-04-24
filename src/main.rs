@@ -242,7 +242,8 @@ async fn crawl(
         .with_return_page_links(true);
 
     let start = Instant::now();
-    website.crawl_raw().await;
+    // Use scrape_raw so page bodies are retained for API quality comparisons.
+    website.scrape_raw().await;
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     let pages = website
