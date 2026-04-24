@@ -1,16 +1,15 @@
 {
   "meta": {
-    "iterations": 1,
+    "iterations": 3,
     "targets": [
       "https://www.rust-lang.org",
       "https://docs.rs",
       "https://tokio.rs"
     ],
     "tools": [
-      "spider-server",
-      "crawl4ai"
+      "spider-server"
     ],
-    "generated_at_unix": 1777050814.1238418
+    "generated_at_unix": 1777060760.349097
   },
   "canonical_titles": {
     "https://www.rust-lang.org": "Rust Programming Language",
@@ -19,27 +18,15 @@
   },
   "summary": {
     "spider-server": {
-      "runs": 3,
-      "successes": 3,
-      "avg_latency_s": 0.2151,
-      "p95_latency_s": 0.2767,
-      "avg_bytes": 79627,
-      "avg_links": 167.33,
+      "runs": 9,
+      "successes": 9,
+      "avg_latency_s": 0.0852,
+      "p95_latency_s": 0.2041,
+      "avg_bytes": 18729,
+      "avg_links": 3.67,
       "title_match_rate": 1,
       "content_presence_rate": 1,
-      "links_presence_rate": 1,
-      "errors": []
-    },
-    "crawl4ai": {
-      "runs": 3,
-      "successes": 3,
-      "avg_latency_s": 0.5109,
-      "p95_latency_s": 0.715,
-      "avg_bytes": 20006,
-      "avg_links": 31.67,
-      "title_match_rate": 1,
-      "content_presence_rate": 1,
-      "links_presence_rate": 1,
+      "links_presence_rate": 0.1111,
       "errors": []
     }
   },
@@ -48,9 +35,9 @@
       "tool": "spider-server",
       "url": "https://www.rust-lang.org",
       "ok": true,
-      "duration_s": 0.12128582999866921,
-      "bytes_extracted": 114515,
-      "link_count": 226,
+      "duration_s": 0.1756705250008963,
+      "bytes_extracted": 18602,
+      "link_count": 33,
       "title": "Rust Programming Language",
       "error": null
     },
@@ -58,9 +45,9 @@
       "tool": "spider-server",
       "url": "https://docs.rs",
       "ok": true,
-      "duration_s": 0.2676368289976381,
-      "bytes_extracted": 64336,
-      "link_count": 149,
+      "duration_s": 0.19464718199742492,
+      "bytes_extracted": 17573,
+      "link_count": 0,
       "title": "Docs.rs",
       "error": null
     },
@@ -68,39 +55,69 @@
       "tool": "spider-server",
       "url": "https://tokio.rs",
       "ok": true,
-      "duration_s": 0.25635883200448006,
-      "bytes_extracted": 60030,
-      "link_count": 127,
+      "duration_s": 0.046888229000614956,
+      "bytes_extracted": 20014,
+      "link_count": 0,
       "title": "Tokio - An asynchronous Rust runtime",
       "error": null
     },
     {
-      "tool": "crawl4ai",
+      "tool": "spider-server",
       "url": "https://www.rust-lang.org",
       "ok": true,
-      "duration_s": 0.6207411340001272,
-      "bytes_extracted": 18440,
-      "link_count": 32,
+      "duration_s": 0.06608197499008384,
+      "bytes_extracted": 18602,
+      "link_count": 0,
       "title": "Rust Programming Language",
       "error": null
     },
     {
-      "tool": "crawl4ai",
+      "tool": "spider-server",
       "url": "https://docs.rs",
       "ok": true,
-      "duration_s": 0.40912715400918387,
-      "bytes_extracted": 16317,
-      "link_count": 33,
+      "duration_s": 0.05139172299823258,
+      "bytes_extracted": 17573,
+      "link_count": 0,
       "title": "Docs.rs",
       "error": null
     },
     {
-      "tool": "crawl4ai",
+      "tool": "spider-server",
       "url": "https://tokio.rs",
       "ok": true,
-      "duration_s": 0.5029083879926475,
-      "bytes_extracted": 25262,
-      "link_count": 30,
+      "duration_s": 0.04465545600396581,
+      "bytes_extracted": 20014,
+      "link_count": 0,
+      "title": "Tokio - An asynchronous Rust runtime",
+      "error": null
+    },
+    {
+      "tool": "spider-server",
+      "url": "https://www.rust-lang.org",
+      "ok": true,
+      "duration_s": 0.06797872399329208,
+      "bytes_extracted": 18602,
+      "link_count": 0,
+      "title": "Rust Programming Language",
+      "error": null
+    },
+    {
+      "tool": "spider-server",
+      "url": "https://docs.rs",
+      "ok": true,
+      "duration_s": 0.07288864901056513,
+      "bytes_extracted": 17573,
+      "link_count": 0,
+      "title": "Docs.rs",
+      "error": null
+    },
+    {
+      "tool": "spider-server",
+      "url": "https://tokio.rs",
+      "ok": true,
+      "duration_s": 0.04657350300112739,
+      "bytes_extracted": 20014,
+      "link_count": 0,
       "title": "Tokio - An asynchronous Rust runtime",
       "error": null
     }
