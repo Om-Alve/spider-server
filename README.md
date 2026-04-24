@@ -195,3 +195,53 @@ docker compose up --build -d
 - Use rotating proxy lists with `proxies` + `anti_bot_profile=camoufox_like` on stricter targets.
 - Protect upstream sites and your own infra by respecting robots and keeping hard bounds enabled.
 - For production, place this service behind a reverse proxy/load balancer and tune process CPU/memory limits.
+
+## Browser mode and auto fallback
+
+The crawl API now supports explicit mode selection:
+
+- `http`: fast HTTP mode (`scrape_raw`)
+- `browser`: browser-rendered mode (`scrape`) when spider is built with `chrome`
+- `auto`: starts in HTTP mode and falls back to browser mode when results are weak
+
+New request fields:
+
+- `crawl_mode` (`http | browser | auto`)
+- `auto_browser_min_pages` (default: `1`)
+- `auto_browser_min_links` (default: `20`)
+- `browser` (optional object):
+  - `chrome_connection_url`
+  - `chrome_intercept`
+  - `block_visuals`
+  - `block_stylesheets`
+  - `block_javascript`
+  - `block_analytics`
+
+Example auto mode payload:
+
+```json
+{
+  "url": "https://example.com",
+  "crawl_mode": "auto",
+  "auto_browser_min_pages": 2,
+  "auto_browser_min_links": 40,
+  "anti_bot_profile": "camoufox_like",
+  "browser": {
+    "chrome_connection_url": "http://127.0.0.1:9222",
+    "chrome_intercept": true,
+    "block_visuals": true,
+    "block_stylesheets": false,
+    "block_javascript": false,
+    "block_analytics": true
+  }
+}
+```
+
+### Camoufox note
+
+This service provides a `camoufox_like` profile for anti-bot posture in HTTP mode
+(realistic Firefox-style user-agent + browser-like header behavior).
+
+If you need full Camoufox runtime integration, run a Camoufox-backed browser endpoint
+and provide it through `browser.chrome_connection_url`, or add a dedicated Camoufox
+backend service behind this API.
