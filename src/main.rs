@@ -1,6 +1,8 @@
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fs,
+    hash::{Hash, Hasher},
     io::Cursor,
     net::SocketAddr,
     sync::{
@@ -17,11 +19,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use lol_html::{element, HtmlRewriter, Settings};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use spider::configuration::RedirectPolicy;
 use spider::features::chrome_common::RequestInterceptConfiguration;
 use spider::page::Page;
+use spider::reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use spider::website::Website;
 use tokio::{
     net::TcpListener,
@@ -39,6 +43,7 @@ struct AppState {
     crawl_permits: Arc<Semaphore>,
     proxy_rotation_cursor: Arc<AtomicUsize>,
     domain_failure_memory: Arc<RwLock<HashMap<String, i32>>>,
+    http_client_cache: Arc<RwLock<HashMap<u64, spider::reqwest::Client>>>,
 }
 
 const DOMAIN_FORCE_BROWSER_THRESHOLD: i32 = 3;
@@ -86,6 +91,7 @@ struct CrawlRequest {
     auto_browser_min_pages: Option<usize>,
     auto_browser_min_links: Option<usize>,
     browser: Option<BrowserModeConfig>,
+    camoufox: Option<CamoufoxConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,6 +120,7 @@ struct ScrapeRequest {
     crawl_mode: Option<CrawlMode>,
     browser: Option<BrowserModeConfig>,
     response_format: Option<ScrapeResponseFormat>,
+    camoufox: Option<CamoufoxConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -168,12 +175,30 @@ struct ApiError {
     message: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum AntiBotProfile {
     Off,
     Basic,
     CamoufoxLike,
+    /// Most aggressive: full Firefox/Camoufox-style header set + stealth toggles.
+    CamoufoxStealth,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct CamoufoxConfig {
+    /// Override Firefox UA pool (one is chosen deterministically per request URL).
+    user_agents: Option<Vec<String>>,
+    /// Locale, e.g. "en-US,en;q=0.9".
+    accept_language: Option<String>,
+    /// Override platform sec-ch-ua-platform style hint (Linux/Windows/macOS).
+    platform: Option<String>,
+    /// Optional extra/override headers merged on top of the camoufox header set.
+    extra_headers: Option<HashMap<String, String>>,
+    /// Default referer for the request when none is provided.
+    referer: Option<String>,
+    /// Toggle DNT header (default true).
+    do_not_track: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -299,6 +324,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         crawl_permits: Arc::new(Semaphore::new(max_concurrent_crawls)),
         proxy_rotation_cursor: Arc::new(AtomicUsize::new(0)),
         domain_failure_memory: Arc::new(RwLock::new(HashMap::new())),
+        http_client_cache: Arc::new(RwLock::new(HashMap::new())),
     };
 
     if state.config.default_proxies.is_empty() {
@@ -489,12 +515,16 @@ async fn crawl_once(state: &AppState, payload: CrawlRequest) -> Result<CrawlResp
     if let Some(user_agent) = payload.user_agent.as_deref() {
         website.with_user_agent(Some(user_agent));
     }
-    if let Some(referer) = payload.referer {
-        website.with_referer(Some(referer));
+    if let Some(ref referer) = payload.referer {
+        website.with_referer(Some(referer.clone()));
     }
     apply_anti_bot_profile(
         &mut website,
         payload.anti_bot_profile.unwrap_or(AntiBotProfile::Basic),
+        &payload.url,
+        payload.user_agent.as_deref(),
+        payload.referer.as_deref(),
+        payload.camoufox.as_ref(),
     );
     configure_browser_mode(&mut website, payload.browser.as_ref(), &crawl_mode);
 
@@ -611,6 +641,7 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
                 requested_profile.clone(),
                 payload.browser.as_ref(),
                 &CrawlMode::Browser,
+                payload.camoufox.as_ref(),
             );
             fetch_single_page_browser(browser_website).await
         }
@@ -629,9 +660,10 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
                     selected_proxies.clone(),
                     payload.user_agent.as_deref(),
                     payload.referer.as_ref(),
-                    AntiBotProfile::CamoufoxLike,
+                    AntiBotProfile::CamoufoxStealth,
                     payload.browser.as_ref(),
                     &CrawlMode::Browser,
+                    payload.camoufox.as_ref(),
                 );
                 current_page = fetch_single_page_browser(warm_browser_website).await;
             }
@@ -653,8 +685,24 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
                     requested_profile.clone(),
                     payload.browser.as_ref(),
                     &CrawlMode::Http,
+                    payload.camoufox.as_ref(),
                 );
-                current_page = fetch_single_page_http(&http_website, &payload.url).await;
+                let cache_key = http_client_cache_key(
+                    payload.user_agent.as_deref(),
+                    selected_proxies.as_deref().unwrap_or(&[]),
+                    request_timeout_secs,
+                    redirect_limit,
+                    payload.redirect_policy.as_ref(),
+                    &requested_profile,
+                    payload.referer.as_deref(),
+                    &payload.url,
+                );
+                current_page = fetch_single_page_http_cached(
+                    &http_website,
+                    &payload.url,
+                    Some((state, cache_key)),
+                )
+                .await;
             }
 
             // Retry with a rotated proxy batch when defaults are in use.
@@ -675,6 +723,7 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
                     requested_profile.clone(),
                     payload.browser.as_ref(),
                     &CrawlMode::Http,
+                    payload.camoufox.as_ref(),
                 );
                 current_page = fetch_single_page_http(&rotated_retry_website, &payload.url).await;
             }
@@ -694,9 +743,10 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
                     selected_proxies.clone(),
                     payload.user_agent.as_deref(),
                     payload.referer.as_ref(),
-                    AntiBotProfile::CamoufoxLike,
+                    AntiBotProfile::CamoufoxStealth,
                     payload.browser.as_ref(),
                     &CrawlMode::Http,
+                    payload.camoufox.as_ref(),
                 );
                 current_page = fetch_single_page_http(&hardened_website, &payload.url).await;
             }
@@ -713,9 +763,10 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
                     selected_proxies.clone(),
                     payload.user_agent.as_deref(),
                     payload.referer.as_ref(),
-                    AntiBotProfile::CamoufoxLike,
+                    AntiBotProfile::CamoufoxStealth,
                     payload.browser.as_ref(),
                     &CrawlMode::Browser,
+                    payload.camoufox.as_ref(),
                 );
                 if let Some(browser_page) = fetch_single_page_browser(browser_website).await {
                     mode_used = CrawlMode::Browser;
@@ -755,6 +806,7 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_scrape_website(
     url: &str,
     request_timeout_secs: u64,
@@ -768,6 +820,7 @@ fn build_scrape_website(
     anti_bot_profile: AntiBotProfile,
     browser: Option<&BrowserModeConfig>,
     crawl_mode: &CrawlMode,
+    camoufox: Option<&CamoufoxConfig>,
 ) -> Website {
     let mut website = Website::new(url);
     website
@@ -793,7 +846,14 @@ fn build_scrape_website(
     if let Some(referer) = referer {
         website.with_referer(Some(referer.clone()));
     }
-    apply_anti_bot_profile(&mut website, anti_bot_profile);
+    apply_anti_bot_profile(
+        &mut website,
+        anti_bot_profile,
+        url,
+        user_agent,
+        referer.map(|r| r.as_str()),
+        camoufox,
+    );
     configure_browser_mode(&mut website, browser, crawl_mode);
 
     website
@@ -809,9 +869,14 @@ fn should_retry_scrape_page(page: Option<&Page>, require_content: bool) -> bool 
         return true;
     }
 
-    let html = page.get_html();
-    let html_trimmed = html.trim();
+    let html_cow = page.get_html_cow();
+    let html_trimmed = html_cow.trim();
     if require_content && html_trimmed.is_empty() {
+        return true;
+    }
+
+    // Fast cheap length pre-check before paying for challenge detection.
+    if require_content && html_trimmed.len() < 512 {
         return true;
     }
 
@@ -820,14 +885,83 @@ fn should_retry_scrape_page(page: Option<&Page>, require_content: bool) -> bool 
     }
 
     if require_content {
-        let text = html_to_text(html_trimmed);
-        let token_count = text.split_whitespace().count();
-        if html_trimmed.len() < 512 || token_count < 40 {
-            return true;
+        // Approximate token density without rendering markdown-style text — this
+        // is enough to detect pages that are essentially empty shells while
+        // avoiding the cost of running html2text on every successful page.
+        let token_count = approximate_visible_token_count(html_trimmed);
+        if token_count < 40 {
+            // Fall back to a real text render to confirm the page is empty
+            // before deciding to retry. This way pages that store text inside
+            // unusual containers still pass the check.
+            let text = html_to_text(html_trimmed);
+            if text.split_whitespace().count() < 40 {
+                return true;
+            }
         }
     }
 
     false
+}
+
+/// Estimate the number of visible word tokens in an HTML document by
+/// streaming over the source and skipping `<script>`/`<style>` blocks. This is
+/// orders of magnitude cheaper than running html2text just to know whether a
+/// page is probably empty.
+fn approximate_visible_token_count(html: &str) -> usize {
+    let mut count = 0_usize;
+    let mut in_tag = false;
+    let mut in_skip_block: Option<&'static str> = None;
+    let mut in_word = false;
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(tag) = in_skip_block {
+            // Look for closing tag like </script> or </style>
+            if b == b'<'
+                && i + 1 + tag.len() < bytes.len()
+                && bytes[i + 1] == b'/'
+                && bytes[i + 2..i + 2 + tag.len()].eq_ignore_ascii_case(tag.as_bytes())
+            {
+                in_skip_block = None;
+                i += 2 + tag.len();
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_tag {
+            if b == b'>' {
+                in_tag = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'<' {
+            in_tag = true;
+            in_word = false;
+            // Detect <script or <style start to enter skip block.
+            let rest = &bytes[i + 1..];
+            if rest.len() >= 6 && rest[..6].eq_ignore_ascii_case(b"script") {
+                in_skip_block = Some("script");
+            } else if rest.len() >= 5 && rest[..5].eq_ignore_ascii_case(b"style") {
+                in_skip_block = Some("style");
+            }
+            i += 1;
+            continue;
+        }
+        if b.is_ascii_whitespace() {
+            in_word = false;
+        } else if !in_word {
+            in_word = true;
+            count += 1;
+            if count >= 64 {
+                return count;
+            }
+        }
+        i += 1;
+    }
+    count
 }
 
 fn is_challenge_or_block_page(html: &str) -> bool {
@@ -872,40 +1006,59 @@ fn map_page(
     max_content_chars: usize,
     response_format: Option<&ScrapeResponseFormat>,
 ) -> CrawledPage {
-    let html = include_content.then(|| page.get_html());
-    let content = html.as_ref().map(|value| {
+    // Borrow the HTML once. `get_html_cow` returns a borrowed slice for the
+    // common UTF-8 case so we avoid the per-call allocation done by
+    // `get_html()`. The actual byte count comes from the underlying buffer
+    // directly, which avoids re-encoding non-UTF-8 content twice.
+    let raw_bytes = page.get_bytes().map(<[u8]>::len).unwrap_or(0);
+    let html_cow = include_content.then(|| page.get_html_cow());
+
+    let content = html_cow.as_ref().map(|value| {
         let rendered = match response_format.unwrap_or(&ScrapeResponseFormat::Html) {
-            ScrapeResponseFormat::Html => value.to_string(),
+            ScrapeResponseFormat::Html => take_chars(value, max_content_chars),
             ScrapeResponseFormat::Text => {
                 let focused = html_to_main_text(value);
-                if focused.split_whitespace().count() < 40 {
+                let chosen = if focused.split_whitespace().count() < 40 {
                     html_to_text(value)
                 } else {
                     focused
-                }
+                };
+                take_chars(&chosen, max_content_chars)
             }
         };
-        rendered.chars().take(max_content_chars).collect::<String>()
+        rendered
     });
 
     let error = page.error_status.as_ref().map(ToString::to_string);
     let links_extracted = page.page_links.as_ref().map_or_else(
-        || count_links_from_html(&page.get_html()),
+        || {
+            html_cow
+                .as_deref()
+                .map(count_links_streaming)
+                .unwrap_or_else(|| count_links_streaming(page.get_html_cow().as_ref()))
+        },
         |links| links.len(),
     );
+
+    let bytes = html_cow.as_ref().map_or(raw_bytes, |value| value.len());
 
     CrawledPage {
         url: page.get_url().to_owned(),
         final_url: page.get_url_final().to_owned(),
         status_code: page.status_code.as_u16(),
-        bytes: html.as_ref().map_or_else(
-            || page.get_bytes().map_or(0, |bytes| bytes.len()),
-            |value| value.len(),
-        ),
+        bytes,
         links_extracted,
         error,
         content,
     }
+}
+
+#[inline]
+fn take_chars(value: &str, max_chars: usize) -> String {
+    if value.len() <= max_chars {
+        return value.to_string();
+    }
+    value.chars().take(max_chars).collect::<String>()
 }
 
 fn configure_browser_mode(
@@ -992,7 +1145,19 @@ async fn recover_single_page_crawl(
 }
 
 async fn fetch_single_page_http(website: &Website, url: &str) -> Option<Page> {
-    let client = website.configure_http_client();
+    fetch_single_page_http_cached(website, url, None).await
+}
+
+async fn fetch_single_page_http_cached(
+    website: &Website,
+    url: &str,
+    cache: Option<(&AppState, u64)>,
+) -> Option<Page> {
+    let client = if let Some((state, key)) = cache {
+        get_or_build_http_client(state, key, website).await
+    } else {
+        website.configure_http_client()
+    };
     let initial = Page::new_page(url, &client).await;
     if initial.status_code.is_success() && !initial.get_html().trim().is_empty() {
         return Some(initial);
@@ -1014,6 +1179,69 @@ async fn fetch_single_page_http(website: &Website, url: &str) -> Option<Page> {
     });
 
     recovered.or(Some(initial))
+}
+
+async fn get_or_build_http_client(
+    state: &AppState,
+    key: u64,
+    website: &Website,
+) -> spider::reqwest::Client {
+    {
+        let cache = state.http_client_cache.read().await;
+        if let Some(client) = cache.get(&key) {
+            return client.clone();
+        }
+    }
+    let client = website.configure_http_client();
+    let mut cache = state.http_client_cache.write().await;
+    if let Some(existing) = cache.get(&key) {
+        return existing.clone();
+    }
+    if cache.len() >= 256 {
+        cache.clear();
+    }
+    cache.insert(key, client.clone());
+    client
+}
+
+/// Fingerprint that identifies a Website's HTTP client configuration. Two
+/// requests that share this key can share the same `reqwest::Client` (and its
+/// connection pool) across requests, which avoids repeated TLS handshakes and
+/// significantly improves throughput on hot benchmark targets.
+#[allow(clippy::too_many_arguments)]
+fn http_client_cache_key(
+    user_agent: Option<&str>,
+    proxies: &[String],
+    request_timeout_secs: u64,
+    redirect_limit: usize,
+    redirect_policy: Option<&RedirectPolicyRequest>,
+    profile: &AntiBotProfile,
+    referer: Option<&str>,
+    target_url: &str,
+) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    user_agent.hash(&mut hasher);
+    proxies.len().hash(&mut hasher);
+    for proxy in proxies {
+        proxy.hash(&mut hasher);
+    }
+    request_timeout_secs.hash(&mut hasher);
+    redirect_limit.hash(&mut hasher);
+    if let Some(p) = redirect_policy {
+        std::mem::discriminant(p).hash(&mut hasher);
+    } else {
+        0_u8.hash(&mut hasher);
+    }
+    std::mem::discriminant(profile).hash(&mut hasher);
+    referer.hash(&mut hasher);
+    // Include the host so each origin gets its own cached client. Some hosts
+    // do not survive aggressive connection pooling under proxy rotation.
+    if let Ok(parsed) = Url::parse(target_url) {
+        if let Some(host) = parsed.host_str() {
+            host.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
 }
 
 async fn fetch_single_page_from_mode(website: &Website, mode: &CrawlMode) -> Option<Page> {
@@ -1082,15 +1310,21 @@ fn html_to_text(html: &str) -> String {
 }
 
 fn html_to_main_text(html: &str) -> String {
-    let main_html = extract_primary_html_block(html).unwrap_or_else(|| html.to_string());
+    let Some(main_html) = extract_primary_html_block(html) else {
+        return html_to_text(html);
+    };
     let focused = html_to_text(&main_html);
-    let full = html_to_text(html);
-
     let focused_tokens = focused.split_whitespace().count();
-    let full_tokens = full.split_whitespace().count();
 
-    // Prefer focused extraction only when it still preserves a substantial
-    // amount of page text; otherwise keep the fuller text for recall.
+    // Cheap heuristic: if the focused fragment's source HTML covers a large
+    // fraction of the document, trust the extraction without rendering the
+    // full document a second time.
+    if focused_tokens >= 120 && main_html.len() * 10 >= html.len().saturating_mul(4) {
+        return focused;
+    }
+
+    let full = html_to_text(html);
+    let full_tokens = full.split_whitespace().count();
     if focused_tokens >= 120
         && (full_tokens == 0 || focused_tokens * 10 >= full_tokens.saturating_mul(4))
     {
@@ -1136,12 +1370,37 @@ fn extract_primary_html_block(html: &str) -> Option<String> {
     best.map(|(_, fragment)| fragment)
 }
 
-fn count_links_from_html(html: &str) -> usize {
-    let parsed = Html::parse_document(html);
-    let Ok(selector) = Selector::parse("a[href]") else {
-        return 0;
+/// Count anchors with non-empty `href` using a streaming HTML rewriter.
+/// This avoids building a full DOM (which `scraper`/`html5ever` does) and is
+/// roughly an order of magnitude faster for typical pages.
+fn count_links_streaming(html: &str) -> usize {
+    let count = RefCell::new(0_usize);
+    let result = {
+        let mut rewriter = HtmlRewriter::new(
+            Settings {
+                element_content_handlers: vec![element!("a[href]", |el| {
+                    if let Some(href) = el.get_attribute("href") {
+                        if !href.trim().is_empty() {
+                            *count.borrow_mut() += 1;
+                        }
+                    }
+                    Ok(())
+                })],
+                ..Settings::default()
+            },
+            |_: &[u8]| {},
+        );
+        rewriter.write(html.as_bytes()).and_then(|_| rewriter.end())
     };
-    parsed.select(&selector).count()
+    if result.is_err() {
+        // Fall back to scraper on malformed input rather than returning 0.
+        let parsed = Html::parse_document(html);
+        if let Ok(selector) = Selector::parse("a[href]") {
+            return parsed.select(&selector).count();
+        }
+        return 0;
+    }
+    count.into_inner()
 }
 
 fn urls_match(a: &str, b: &str) -> bool {
@@ -1306,7 +1565,155 @@ fn normalize_single_proxy(value: &str, default_scheme: &str) -> Result<Option<St
     ))
 }
 
-fn apply_anti_bot_profile(website: &mut Website, profile: AntiBotProfile) {
+/// Camoufox-style Firefox UA pool. Each entry is a real, recent Firefox UA
+/// across major desktop platforms. We deterministically pick one per request
+/// URL so consecutive scrapes of the same target stay consistent (which helps
+/// avoid suspicion from servers that fingerprint UA churn) while different
+/// targets get different identities.
+const CAMOUFOX_UA_POOL: &[&str] = &[
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.6; rv:131.0) Gecko/20100101 Firefox/131.0",
+];
+
+fn pick_camoufox_user_agent(url: &str, override_pool: Option<&[String]>) -> String {
+    let pool: Vec<&str> = match override_pool {
+        Some(list) if !list.is_empty() => list.iter().map(String::as_str).collect(),
+        _ => CAMOUFOX_UA_POOL.to_vec(),
+    };
+    if pool.is_empty() {
+        return CAMOUFOX_UA_POOL[0].to_string();
+    }
+    let host = Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| url.to_string());
+    let hash = host.bytes().fold(5381_u64, |acc, b| {
+        acc.wrapping_mul(33).wrapping_add(b as u64)
+    });
+    let idx = (hash as usize) % pool.len();
+    pool[idx].to_string()
+}
+
+fn camoufox_platform_hint(user_agent: &str, override_value: Option<&str>) -> &'static str {
+    if let Some(value) = override_value {
+        if value.eq_ignore_ascii_case("windows") {
+            return "Windows";
+        } else if value.eq_ignore_ascii_case("macos") || value.eq_ignore_ascii_case("mac") {
+            return "macOS";
+        } else if value.eq_ignore_ascii_case("linux") {
+            return "Linux";
+        }
+    }
+    if user_agent.contains("Windows") {
+        "Windows"
+    } else if user_agent.contains("Mac OS") || user_agent.contains("Macintosh") {
+        "macOS"
+    } else {
+        "Linux"
+    }
+}
+
+/// Build a Camoufox-style Firefox HTTP header set. These headers mirror what a
+/// real, fully configured Firefox sends on a top-level navigation, including
+/// Sec-Fetch-* metadata, encoding, language, and anti-tracking hints.
+fn build_camoufox_headers(
+    target_url: &str,
+    user_agent: &str,
+    referer: Option<&str>,
+    config: Option<&CamoufoxConfig>,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+
+    let accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+    let language = config
+        .and_then(|c| c.accept_language.as_deref())
+        .unwrap_or("en-US,en;q=0.9");
+    let dnt = config.and_then(|c| c.do_not_track).unwrap_or(true);
+    let platform = camoufox_platform_hint(user_agent, config.and_then(|c| c.platform.as_deref()));
+
+    let entries: &[(&str, &str)] = &[
+        ("accept", accept),
+        ("accept-language", language),
+        ("accept-encoding", "gzip, deflate, br, zstd"),
+        ("upgrade-insecure-requests", "1"),
+        ("sec-fetch-dest", "document"),
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-site", "none"),
+        ("sec-fetch-user", "?1"),
+        ("sec-gpc", "1"),
+        ("priority", "u=0, i"),
+        ("cache-control", "no-cache"),
+        ("pragma", "no-cache"),
+        ("te", "trailers"),
+    ];
+
+    for (name, value) in entries {
+        if let (Ok(name), Ok(value)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
+            headers.insert(name, value);
+        }
+    }
+
+    if dnt {
+        headers.insert("dnt", HeaderValue::from_static("1"));
+    }
+
+    headers.insert("x-platform", HeaderValue::from_static(platform));
+
+    if let Some(referer) = referer {
+        if let Ok(value) = HeaderValue::from_str(referer) {
+            headers.insert(spider::reqwest::header::REFERER, value);
+        }
+    } else if let Some(referer) = config
+        .and_then(|c| c.referer.as_deref())
+        .or(Some(camoufox_default_referer(target_url)))
+    {
+        if let Ok(value) = HeaderValue::from_str(referer) {
+            headers.insert(spider::reqwest::header::REFERER, value);
+        }
+    }
+
+    if let Some(extras) = config.and_then(|c| c.extra_headers.as_ref()) {
+        for (name, value) in extras {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+    }
+
+    headers
+}
+
+fn camoufox_default_referer(target_url: &str) -> &'static str {
+    let host = Url::parse(target_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_default();
+    if host.ends_with(".cn") {
+        "https://www.baidu.com/"
+    } else if host.ends_with(".ru") {
+        "https://yandex.ru/"
+    } else if host.ends_with(".jp") {
+        "https://www.yahoo.co.jp/"
+    } else {
+        "https://www.google.com/"
+    }
+}
+
+fn apply_anti_bot_profile(
+    website: &mut Website,
+    profile: AntiBotProfile,
+    target_url: &str,
+    explicit_user_agent: Option<&str>,
+    explicit_referer: Option<&str>,
+    camoufox: Option<&CamoufoxConfig>,
+) {
     match profile {
         AntiBotProfile::Off => {
             website
@@ -1318,15 +1725,37 @@ fn apply_anti_bot_profile(website: &mut Website, profile: AntiBotProfile) {
                 .with_modify_headers(true)
                 .with_modify_http_client_headers(true);
         }
-        AntiBotProfile::CamoufoxLike => {
-            // HTTP-mode approximation of camoufox-style evasive posture.
+        AntiBotProfile::CamoufoxLike | AntiBotProfile::CamoufoxStealth => {
+            let user_agent = explicit_user_agent
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    pick_camoufox_user_agent(target_url, camoufox.and_then(|c| c.user_agents.as_deref()))
+                });
+
+            let headers =
+                build_camoufox_headers(target_url, &user_agent, explicit_referer, camoufox);
+
             website
                 .with_modify_headers(true)
                 .with_modify_http_client_headers(true)
-                .with_user_agent(Some(
-                    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
-                ))
-                .with_referer(Some("https://www.google.com/".to_string()));
+                .with_user_agent(Some(&user_agent))
+                .with_headers(Some(headers));
+
+            // Set a referer field so spider also propagates it via its own logic.
+            let referer = explicit_referer
+                .map(str::to_string)
+                .or_else(|| camoufox.and_then(|c| c.referer.clone()))
+                .unwrap_or_else(|| camoufox_default_referer(target_url).to_string());
+            website.with_referer(Some(referer));
+
+            if matches!(profile, AntiBotProfile::CamoufoxStealth) {
+                // These are no-ops without `chrome` feature, but become useful
+                // the moment chrome is enabled.
+                website.with_stealth(true).with_fingerprint(true);
+                if let Some(locale) = camoufox.and_then(|c| c.accept_language.clone()) {
+                    website.with_locale(Some(locale));
+                }
+            }
         }
     }
 }

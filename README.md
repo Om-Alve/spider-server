@@ -62,7 +62,7 @@ Request fields:
 - `include_content` (optional, default true)
 - `max_content_chars` (optional)
 - `proxies` (optional): list of `http://`, `https://`, `socks5://`, or `socks5h://` proxies
-- `anti_bot_profile` (optional): `off`, `basic`, or `camoufox_like`
+- `anti_bot_profile` (optional): `off`, `basic`, `camoufox_like`, or `camoufox_stealth`
 - `user_agent` (optional): override User-Agent
 - `referer` (optional): set Referer header
 - `redirect_policy` (optional): `loose`, `strict`, `none`
@@ -70,6 +70,13 @@ Request fields:
 - `crawl_mode` (optional): `http`, `browser`, `auto`
 - `browser` (optional): same browser options as `/crawl`
 - `response_format` (optional): `html` or `text` (default: `text`)
+- `camoufox` (optional): camoufox-style HTTP fingerprint configuration:
+  - `user_agents`: list of Firefox UAs to rotate (per-host deterministic)
+  - `accept_language`: e.g. `"fr-FR,fr;q=0.8"`
+  - `platform`: `"linux"`, `"windows"`, or `"macos"` (sets `x-platform` hint)
+  - `extra_headers`: extra/override headers merged on top of camoufox set
+  - `referer`: default referer if `referer` is not set
+  - `do_not_track`: toggle DNT header (default: `true`)
 
 Response (shape):
 
@@ -285,6 +292,10 @@ docker compose up --build -d
 - Use rotating proxy lists with `proxies` + `anti_bot_profile=camoufox_like` on stricter targets.
 - Protect upstream sites and your own infra by respecting robots and keeping hard bounds enabled.
 - For production, place this service behind a reverse proxy/load balancer and tune process CPU/memory limits.
+- `/scrape` reuses one `reqwest::Client` per (UA, proxy set, redirect, profile, host) tuple, so repeated calls to the same target avoid TLS/DNS handshakes and reuse connection pools.
+- Link counting and emptiness detection use a streaming HTML scan
+  (`lol_html` + a SAX-style token counter) instead of a full DOM parse, which
+  trims most of the per-response CPU cost.
 
 ## Browser mode and auto fallback
 
@@ -332,10 +343,39 @@ Example auto mode payload:
 `/scrape` also supports `crawl_mode: "auto"`. It first attempts HTTP mode and falls back to
 browser mode when the single-page result is missing, non-2xx, or empty.
 
-### Camoufox note
+### Camoufox profiles
 
-This service provides a `camoufox_like` profile for anti-bot posture in HTTP mode
-(realistic Firefox-style user-agent + browser-like header behavior).
+This service ships two profiles for emulating a Camoufox-style Firefox client
+in HTTP mode:
+
+- `camoufox_like`: realistic Firefox UA, randomized per-host from a curated
+  pool, with a full Firefox header set (Accept, Accept-Language,
+  Accept-Encoding, Sec-Fetch-*, Upgrade-Insecure-Requests, DNT, Sec-GPC,
+  Priority, Cache-Control, Pragma, TE), and a context-aware default Referer.
+- `camoufox_stealth`: everything in `camoufox_like` plus enables spider's
+  stealth/fingerprint toggles (effective when built with `chrome`) and the
+  configured locale. Used automatically as a hardened HTTP retry before
+  falling back to a browser, and as the warm-up profile for domains that
+  recently failed in HTTP mode.
+
+You can further tune both profiles with the `camoufox` request field:
+
+```json
+{
+  "url": "https://example.com",
+  "anti_bot_profile": "camoufox_stealth",
+  "camoufox": {
+    "user_agents": [
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5; rv:128.0) Gecko/20100101 Firefox/128.0"
+    ],
+    "accept_language": "en-US,en;q=0.9",
+    "platform": "macos",
+    "extra_headers": { "x-real-client": "scraper" },
+    "referer": "https://duckduckgo.com/",
+    "do_not_track": true
+  }
+}
+```
 
 ## Benchmarks with rotating proxies
 
