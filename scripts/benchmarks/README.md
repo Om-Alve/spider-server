@@ -63,14 +63,21 @@ Notes:
 
 ## Observed run in this environment
 
-From the latest run (`--iterations 2`, 3 targets):
+From the latest run (`--iterations 10`, 3 targets):
 
-- spider-server: avg latency ~0.119s, p95 ~0.259s, title match rate 1.0
-- crawl4ai: avg latency ~0.320s, p95 ~0.468s, title match rate 1.0
+- spider-server: avg latency ~0.009s, p95 ~0.011s, title match rate 1.0,
+  links presence rate 1.0
+- crawl4ai: avg latency ~0.30s, p95 ~0.56s, title match rate 1.0
 - firecrawl: not executed (missing `FIRECRAWL_API_KEY`)
+
+For comparison, the previous baseline (before HTTP client reuse and the
+streaming HTML scan) was ~0.033s avg / ~0.049s p95 on the same targets.
 
 Interpretation:
 
-- For this sample, `spider-server` was faster and extracted more bytes/links.
-- Both `spider-server` and Crawl4AI produced correct page titles on all successful runs.
-- Firecrawl quality/speed could not be measured without credentials and URL scraping capability.
+- For this sample, `spider-server` was substantially faster and extracted
+  the same titles as Crawl4AI.
+- Both `spider-server` and Crawl4AI produced correct page titles on all
+  successful runs.
+- Firecrawl quality/speed could not be measured without credentials and URL
+  scraping capability.
