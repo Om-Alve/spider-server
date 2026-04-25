@@ -33,7 +33,7 @@ fn is_negative_class_or_id(s: &str) -> bool {
     NEG_PATTERNS.iter().any(|m| s.contains(m))
 }
 
-#[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PruningType {
     #[default]
@@ -41,8 +41,49 @@ pub enum PruningType {
     Dynamic,
 }
 
+/// Named extraction presets (Steiner contract). When `fit_markdown` is left at defaults,
+/// the profile replaces the baseline tuning.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionProfile {
+    #[default]
+    Balanced,
+    Docs,
+    Article,
+    Repo,
+    Minimal,
+}
+
+impl ExtractionProfile {
+    pub fn fit_options(self) -> FitMarkdownOptions {
+        match self {
+            Self::Balanced => FitMarkdownOptions::default(),
+            Self::Docs => FitMarkdownOptions {
+                pruning_threshold: 0.32,
+                pruning_type: PruningType::Dynamic,
+                min_word_threshold: Some(3),
+            },
+            Self::Article => FitMarkdownOptions {
+                pruning_threshold: 0.38,
+                pruning_type: PruningType::Dynamic,
+                min_word_threshold: Some(4),
+            },
+            Self::Repo => FitMarkdownOptions {
+                pruning_threshold: 0.36,
+                pruning_type: PruningType::Fixed,
+                min_word_threshold: Some(3),
+            },
+            Self::Minimal => FitMarkdownOptions {
+                pruning_threshold: 0.58,
+                pruning_type: PruningType::Fixed,
+                min_word_threshold: Some(10),
+            },
+        }
+    }
+}
+
 /// Optional tuning (defaults are Crawl4AI PruningContentFilter–like: threshold ~0.48, min words 5).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct FitMarkdownOptions {
     pub pruning_threshold: f64,
@@ -355,7 +396,7 @@ pub fn build_fit_markdown(
 ) -> std::io::Result<FitMarkdown> {
     let c = PruningConfig::from_opts(opts);
     let stripped = strip_excluded_hostile(full_html);
-    let raw_markdown = md().convert(&stripped)?;
+    let raw_markdown = normalize_markdown_output(&md().convert(&stripped)?);
     let target = if let Some(m) = best_semantic_fragment(&stripped) {
         m
     } else {
@@ -367,10 +408,95 @@ pub fn build_fit_markdown(
     if fit_html.split_whitespace().count() < 10 {
         fit_html = target;
     }
-    let fit_markdown = md().convert(&fit_html)?;
+    let fit_markdown = normalize_markdown_output(&md().convert(&fit_html)?);
     Ok(FitMarkdown {
         raw_markdown,
         fit_markdown,
         fit_html,
     })
+}
+
+/// Fast density-style score in `[0, 1]` for auto-mode fallback (no full markdown pass).
+pub fn quick_main_content_score(html: &str) -> f64 {
+    let sample = if html.len() > 400_000 {
+        &html[..400_000]
+    } else {
+        html
+    };
+    let doc = Html::parse_document(sample);
+    let Ok(body_sel) = Selector::parse("body") else {
+        return 0.0;
+    };
+    let body_text: String = doc
+        .select(&body_sel)
+        .next()
+        .map(|b| b.text().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+    let words = body_text.split_whitespace().count().max(1);
+    let html_len = sample.len().max(1);
+    let density = (body_text.len() as f64 / html_len as f64).min(1.0);
+    let mut bonus = 0.0f64;
+    let Ok(main_sel) = Selector::parse("main, article, [role=main]") else {
+        return (density * 0.85 + (words.min(500) as f64 / 500.0) * 0.15).clamp(0.0, 1.0);
+    };
+    if doc.select(&main_sel).next().is_some() {
+        bonus = 0.12;
+    }
+    (density * 0.75 + (words.min(800) as f64 / 800.0) * 0.2 + bonus).clamp(0.0, 1.0)
+}
+
+fn strip_data_uri_images(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut cursor = 0usize;
+    while let Some(rel) = md[cursor..].find("](data:image") {
+        let pos = cursor + rel;
+        let prefix = &md[cursor..pos];
+        if let Some(start_rel) = prefix.rfind("![") {
+            let start = cursor + start_rel;
+            out.push_str(&md[cursor..start]);
+            let after = &md[pos + 1..];
+            let close = after.find(')').unwrap_or(after.len());
+            cursor = pos + 1 + close + 1;
+            continue;
+        }
+        out.push_str(&md[cursor..=pos]);
+        cursor = pos + 1;
+    }
+    out.push_str(&md[cursor..]);
+    out
+}
+
+fn collapse_blank_lines(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut newline_run = 0usize;
+    for c in md.chars() {
+        if c == '\n' {
+            newline_run += 1;
+            if newline_run <= 2 {
+                out.push('\n');
+            }
+        } else {
+            newline_run = 0;
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Collapse excessive blank lines and strip inline base64 image payloads from markdown.
+pub fn normalize_markdown_output(md: &str) -> String {
+    collapse_blank_lines(&strip_data_uri_images(md))
+}
+
+pub fn resolve_fit_options(
+    profile: Option<ExtractionProfile>,
+    opts: &FitMarkdownOptions,
+) -> FitMarkdownOptions {
+    let Some(p) = profile.filter(|p| *p != ExtractionProfile::Balanced) else {
+        return opts.clone();
+    };
+    if *opts == FitMarkdownOptions::default() {
+        return p.fit_options();
+    }
+    opts.clone()
 }

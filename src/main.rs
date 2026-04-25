@@ -1,4 +1,5 @@
 mod fit_markdown;
+mod scrape_contract;
 
 use std::{
     collections::HashMap,
@@ -21,19 +22,23 @@ use axum::{
 };
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-use spider::configuration::RedirectPolicy;
+use spider::configuration::{RedirectPolicy, Viewport, WaitForDelay, WaitForIdleNetwork, WaitForSelector};
 use spider::features::chrome_common::RequestInterceptConfiguration;
 use spider::page::Page;
 use spider::website::Website;
 use tokio::{
     net::TcpListener,
-    sync::{RwLock, Semaphore},
+    sync::{Mutex, RwLock, Semaphore},
+    task::JoinSet,
     time::Instant,
 };
 use tower::{limit::ConcurrencyLimitLayer, ServiceBuilder};
 use tower_http::{compression::CompressionLayer, limit::RequestBodyLimitLayer, trace::TraceLayer};
 use tracing::{info, warn};
 use url::Url;
+
+use crate::scrape_contract::{FallbackReason, MarkdownSection, ScrapeError, ScrapeSignals};
+use fit_markdown::ExtractionProfile;
 
 #[derive(Clone)]
 struct AppState {
@@ -125,14 +130,64 @@ struct ScrapeRequest {
     include_markdown: Option<bool>,
     #[serde(default)]
     fit_markdown: fit_markdown::FitMarkdownOptions,
+    /// When `fit_markdown` is left at defaults, selects pruning presets (`balanced`, `docs`, `article`, `repo`, `minimal`).
+    extraction_profile: Option<ExtractionProfile>,
+    /// Minimum visible word count before HTTP is considered weak in `auto` mode.
+    auto_browser_min_words: Option<usize>,
+    /// Minimum [`fit_markdown::quick_main_content_score`] before HTTP is considered weak in `auto` mode.
+    auto_browser_min_main_content_score: Option<f64>,
+    /// Extra HTTP status codes (in addition to defaults) that trigger browser fallback in `auto` mode.
+    auto_browser_blocked_statuses: Option<Vec<u16>>,
+    /// If set, `auto` mode may fall back to browser when this text is missing from the HTML body.
+    required_text: Option<String>,
+    /// If set, browser mode waits for this selector; in `auto`, missing selector can trigger browser after HTTP.
+    wait_for_selector: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct ScrapeResponse {
     root_url: String,
-    scrape_duration_ms: u64,
+    final_url: Option<String>,
+    status_code: Option<u16>,
+    content_type: String,
+    duration_ms: u64,
     mode_used: CrawlMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    markdown: Option<MarkdownSection>,
+    title: Option<String>,
+    error: Option<ScrapeError>,
+    signals: ScrapeSignals,
+    /// Legacy nested page object for older clients and benchmarks.
+    #[serde(skip_serializing_if = "Option::is_none")]
     page: Option<CrawledPage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchScrapeRequest {
+    requests: Vec<ScrapeRequest>,
+    #[serde(default)]
+    global_concurrency: Option<usize>,
+    #[serde(default)]
+    per_host_concurrency: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchScrapeResponse {
+    batch_duration_ms: u64,
+    results: Vec<BatchScrapeItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchScrapeItem {
+    index: usize,
+    ok: bool,
+    duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response: Option<ScrapeResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -206,7 +261,7 @@ enum CrawlMode {
     Auto,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ScrapeResponseFormat {
     Html,
@@ -223,6 +278,20 @@ struct BrowserModeConfig {
     block_stylesheets: Option<bool>,
     block_javascript: Option<bool>,
     block_analytics: Option<bool>,
+    /// Hard cap for the browser navigation / resource wait phase (seconds).
+    page_timeout_secs: Option<u64>,
+    /// `domcontentloaded`, `load`, or `networkidle` (best-effort mapping to spider wait hooks).
+    wait_for_load: Option<String>,
+    /// Optional post-load delay (milliseconds).
+    wait_ms_after_load: Option<u64>,
+    /// Timeout for [`Self::wait_for_selector`] (seconds).
+    wait_for_selector_timeout_secs: Option<u64>,
+    /// When false, disables JavaScript in the intercept pipeline.
+    javascript_enabled: Option<bool>,
+    viewport_width: Option<u32>,
+    viewport_height: Option<u32>,
+    /// When true, enables spider screenshot capture (off by default).
+    screenshot: Option<bool>,
 }
 
 impl From<RedirectPolicyRequest> for RedirectPolicy {
@@ -330,6 +399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/scrape", post(scrape))
+        .route("/scrape/batch", post(scrape_batch))
         .route("/crawl", post(crawl))
         .route("/crawl/batch", post(crawl_batch))
         .with_state(state)
@@ -369,6 +439,100 @@ async fn scrape(
 ) -> Result<Json<ScrapeResponse>, ApiError> {
     let response = scrape_once(&state, payload).await?;
     Ok(Json(response))
+}
+
+async fn scrape_batch(
+    State(state): State<AppState>,
+    Json(payload): Json<BatchScrapeRequest>,
+) -> Result<Json<BatchScrapeResponse>, ApiError> {
+    if payload.requests.is_empty() {
+        return Err(ApiError::bad_request(
+            "requests must contain at least one item",
+        ));
+    }
+    let max_b = read_env_parse("MAX_SCRAPE_BATCH", 32usize);
+    if payload.requests.len() > max_b {
+        return Err(ApiError::bad_request(format!(
+            "batch size exceeds maximum ({max_b})"
+        )));
+    }
+    let global_c = payload
+        .global_concurrency
+        .unwrap_or_else(|| read_env_parse("SCRAPE_BATCH_GLOBAL_CONCURRENCY", 16usize))
+        .max(1);
+    let per_host = payload
+        .per_host_concurrency
+        .unwrap_or_else(|| read_env_parse("SCRAPE_BATCH_PER_HOST", 4usize))
+        .max(1);
+
+    let global = Arc::new(Semaphore::new(global_c));
+    let host_locks: Arc<Mutex<HashMap<String, Arc<Semaphore>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let n = payload.requests.len();
+    let start = Instant::now();
+    let mut join_set = JoinSet::new();
+    for (index, item) in payload.requests.into_iter().enumerate() {
+        let state = state.clone();
+        let global = global.clone();
+        let host_locks = host_locks.clone();
+        join_set.spawn(async move {
+            let host = extract_host_key(&item.url).unwrap_or_default();
+            let host_sem = {
+                let mut m = host_locks.lock().await;
+                m.entry(host)
+                    .or_insert_with(|| Arc::new(Semaphore::new(per_host)))
+                    .clone()
+            };
+            let _g = global
+                .acquire_owned()
+                .await
+                .expect("batch global semaphore");
+            let _h = host_sem
+                .acquire_owned()
+                .await
+                .expect("batch host semaphore");
+            let inner_start = Instant::now();
+            let res = scrape_once(&state, item).await;
+            let d = inner_start.elapsed().as_millis() as u64;
+            (index, d, res)
+        });
+    }
+
+    let mut slots: Vec<Option<BatchScrapeItem>> = (0..n).map(|_| None).collect();
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok((index, duration_ms, Ok(response))) => {
+                slots[index] = Some(BatchScrapeItem {
+                    index,
+                    ok: true,
+                    duration_ms,
+                    response: Some(response),
+                    error: None,
+                });
+            }
+            Ok((index, duration_ms, Err(err))) => {
+                slots[index] = Some(BatchScrapeItem {
+                    index,
+                    ok: false,
+                    duration_ms,
+                    response: None,
+                    error: Some(err.message),
+                });
+            }
+            Err(join_err) => {
+                return Err(ApiError::bad_request(format!(
+                    "batch worker join error: {join_err}"
+                )));
+            }
+        }
+    }
+
+    let mut results: Vec<BatchScrapeItem> = slots.into_iter().flatten().collect();
+    results.sort_by_key(|x| x.index);
+    Ok(Json(BatchScrapeResponse {
+        batch_duration_ms: start.elapsed().as_millis() as u64,
+        results,
+    }))
 }
 
 async fn crawl_batch(
@@ -572,6 +736,202 @@ async fn crawl_once(state: &AppState, payload: CrawlRequest) -> Result<CrawlResp
     })
 }
 
+struct AutoBrowserPolicy {
+    min_words: usize,
+    min_main_score: f64,
+    max_link_density: f64,
+    blocked_statuses: Vec<u16>,
+}
+
+impl AutoBrowserPolicy {
+    fn from_request(payload: &ScrapeRequest) -> Self {
+        Self {
+            min_words: payload.auto_browser_min_words.unwrap_or(150),
+            min_main_score: payload.auto_browser_min_main_content_score.unwrap_or(0.45),
+            max_link_density: 6.0,
+            blocked_statuses: merge_blocked_statuses(payload.auto_browser_blocked_statuses.clone()),
+        }
+    }
+}
+
+fn merge_blocked_statuses(extra: Option<Vec<u16>>) -> Vec<u16> {
+    let mut v = vec![
+        403_u16, 407, 408, 409, 410, 425, 429, 451, 503,
+    ];
+    if let Some(e) = extra {
+        for x in e {
+            if !v.contains(&x) {
+                v.push(x);
+            }
+        }
+    }
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+fn status_triggers_http_retry(status: u16) -> bool {
+    matches!(
+        status,
+        403 | 407 | 408 | 409 | 410 | 425 | 429 | 451
+    ) || status >= 500
+}
+
+/// Coarse retry signal for proxy rotation (keeps legacy ~40 word threshold).
+fn http_retry_for_fetch_attempt(page: Option<&Page>, require_content: bool) -> bool {
+    let Some(page) = page else {
+        return true;
+    };
+    let status = page.status_code.as_u16();
+    if status_triggers_http_retry(status) {
+        return true;
+    }
+    let html = page.get_html();
+    let html_trimmed = html.trim();
+    if require_content && html_trimmed.is_empty() {
+        return true;
+    }
+    if scrape_contract::html_challenge_markers_hit(html_trimmed) {
+        return true;
+    }
+    if require_content {
+        let wc = scrape_contract::fast_visible_word_count(html_trimmed);
+        if html_trimmed.len() < 512 || wc < 40 {
+            return true;
+        }
+    }
+    false
+}
+
+fn link_count_for_page(page: &Page, html: &str) -> usize {
+    page
+        .page_links
+        .as_ref()
+        .map(|s| s.len())
+        .unwrap_or_else(|| count_links_from_html(html))
+}
+
+fn http_auto_fallback_reason(
+    page: Option<&Page>,
+    require_content: bool,
+    policy: &AutoBrowserPolicy,
+    wait_sel: Option<&str>,
+    req_text: Option<&str>,
+) -> Option<FallbackReason> {
+    let Some(page) = page else {
+        return Some(FallbackReason::HttpEmpty);
+    };
+    let status = page.status_code.as_u16();
+    if !page.status_code.is_success() {
+        if status >= 500 || policy.blocked_statuses.contains(&status) {
+            return Some(FallbackReason::HttpBadStatus);
+        }
+        return None;
+    }
+    let html = page.get_html();
+    let html_trimmed = html.trim();
+    if require_content && html_trimmed.is_empty() {
+        return Some(FallbackReason::HttpEmpty);
+    }
+    if scrape_contract::html_challenge_markers_hit(html_trimmed) {
+        return Some(FallbackReason::HttpChallenge);
+    }
+    if let Some(t) = req_text {
+        if !scrape_contract::html_contains_text_ci(html_trimmed, t) {
+            return Some(FallbackReason::RequiredTextMissing);
+        }
+    }
+    if let Some(sel) = wait_sel {
+        if !scrape_contract::html_has_selector(html_trimmed, sel) {
+            return Some(FallbackReason::WaitForSelectorMissing);
+        }
+    }
+    if require_content {
+        let wc = scrape_contract::fast_visible_word_count(html_trimmed);
+        if wc < policy.min_words {
+            return Some(FallbackReason::HttpLowWords);
+        }
+        let score = fit_markdown::quick_main_content_score(html_trimmed);
+        if score < policy.min_main_score {
+            return Some(FallbackReason::HttpLowMainScore);
+        }
+        let links = link_count_for_page(page, html_trimmed);
+        let ld = if wc > 0 {
+            links as f64 / wc as f64
+        } else {
+            f64::INFINITY
+        };
+        if ld > policy.max_link_density {
+            return Some(FallbackReason::HttpLowDensity);
+        }
+    }
+    None
+}
+
+fn effective_crawl_mode(requested: &CrawlMode, used_browser: bool) -> CrawlMode {
+    match requested {
+        CrawlMode::Auto if !used_browser => CrawlMode::Auto,
+        CrawlMode::Auto => CrawlMode::Browser,
+        other => other.clone(),
+    }
+}
+
+fn build_scrape_error(
+    page: Option<&Page>,
+    crawled: Option<&CrawledPage>,
+    want_markdown: bool,
+    ctype: &str,
+    unsupported: bool,
+) -> Option<ScrapeError> {
+    if unsupported {
+        return Some(ScrapeError {
+            code: "unsupported_content_type",
+            message: format!("content-type {ctype} is not supported for extraction"),
+            retryable: false,
+        });
+    }
+    let Some(page) = page else {
+        return Some(ScrapeError {
+            code: "empty_content",
+            message: "no page could be fetched".into(),
+            retryable: true,
+        });
+    };
+    if let Some(err) = page.error_status.as_ref() {
+        return Some(scrape_contract::scrape_error_for_network_message(err));
+    }
+    if !page.status_code.is_success() {
+        let st = page.status_code.as_u16();
+        return Some(ScrapeError {
+            code: "http_error",
+            message: format!("upstream HTTP {st}"),
+            retryable: st >= 500 || st == 429,
+        });
+    }
+    let html_empty = page.get_html().trim().is_empty();
+    if html_empty {
+        return Some(ScrapeError {
+            code: "empty_content",
+            message: "empty document body".into(),
+            retryable: true,
+        });
+    }
+    if want_markdown && !unsupported {
+        let empty_md = crawled
+            .and_then(|c| c.markdown.as_ref())
+            .map(|m| m.fit_markdown.trim().is_empty() && m.raw_markdown.trim().is_empty())
+            .unwrap_or(true);
+        if empty_md {
+            return Some(ScrapeError {
+                code: "empty_content",
+                message: "markdown extraction produced no usable text".into(),
+                retryable: false,
+            });
+        }
+    }
+    None
+}
+
 async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeResponse, ApiError> {
     validate_target_url(&payload.url)?;
 
@@ -605,6 +965,8 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
     let include_content = payload.include_content.unwrap_or(true);
     let response_format = payload
         .response_format
+        .as_ref()
+        .copied()
         .unwrap_or(ScrapeResponseFormat::Text);
     let want_markdown = payload.include_markdown == Some(true)
         || matches!(response_format, ScrapeResponseFormat::Markdown);
@@ -626,9 +988,15 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
     };
 
     let start = Instant::now();
-    let mut mode_used = crawl_mode.clone();
+    let auto_policy = AutoBrowserPolicy::from_request(&payload);
+    let wait_sel = payload.wait_for_selector.as_deref();
+    let req_text = payload.required_text.as_deref();
+    let mut used_browser = false;
+    let mut fallback_reason = FallbackReason::None;
+
     let page = match &crawl_mode {
         CrawlMode::Browser => {
+            used_browser = true;
             let browser_website = build_scrape_website(
                 &payload.url,
                 request_timeout_secs,
@@ -642,14 +1010,15 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
                 requested_profile.clone(),
                 payload.browser.as_ref(),
                 &CrawlMode::Browser,
+                wait_sel,
             );
             fetch_single_page_browser(browser_website).await
         }
         CrawlMode::Http | CrawlMode::Auto => {
-            let mut current_page = None;
+            let mut current_page = Option::<Page>::None;
 
-            // If this domain repeatedly fails in HTTP mode, jump to browser first.
             if force_browser_for_domain {
+                fallback_reason = FallbackReason::HttpBlocked;
                 let warm_browser_website = build_scrape_website(
                     &payload.url,
                     request_timeout_secs,
@@ -663,13 +1032,14 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
                     AntiBotProfile::CamoufoxLike,
                     payload.browser.as_ref(),
                     &CrawlMode::Browser,
+                    wait_sel,
                 );
                 current_page = fetch_single_page_browser(warm_browser_website).await;
+                used_browser = current_page.is_some();
             }
 
-            // Primary HTTP attempt.
             if current_page.is_none()
-                || should_retry_scrape_page(current_page.as_ref(), require_substantive)
+                || http_retry_for_fetch_attempt(current_page.as_ref(), require_substantive)
             {
                 let http_website = build_scrape_website(
                     &payload.url,
@@ -684,12 +1054,12 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
                     requested_profile.clone(),
                     payload.browser.as_ref(),
                     &CrawlMode::Http,
+                    None,
                 );
                 current_page = fetch_single_page_http(&http_website, &payload.url).await;
             }
 
-            // Retry with a rotated proxy batch when defaults are in use.
-            if should_retry_scrape_page(current_page.as_ref(), require_substantive) {
+            if http_retry_for_fetch_attempt(current_page.as_ref(), require_substantive) {
                 if !has_explicit_proxies && !state.config.default_proxies.is_empty() {
                     selected_proxies = resolve_request_proxies(None, state)?;
                 }
@@ -706,12 +1076,12 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
                     requested_profile.clone(),
                     payload.browser.as_ref(),
                     &CrawlMode::Http,
+                    None,
                 );
                 current_page = fetch_single_page_http(&rotated_retry_website, &payload.url).await;
             }
 
-            // Hardened retry with camoufox-like profile.
-            if should_retry_scrape_page(current_page.as_ref(), require_substantive) {
+            if http_retry_for_fetch_attempt(current_page.as_ref(), require_substantive) {
                 if !has_explicit_proxies && !state.config.default_proxies.is_empty() {
                     selected_proxies = resolve_request_proxies(None, state)?;
                 }
@@ -728,12 +1098,47 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
                     AntiBotProfile::CamoufoxLike,
                     payload.browser.as_ref(),
                     &CrawlMode::Http,
+                    None,
                 );
                 current_page = fetch_single_page_http(&hardened_website, &payload.url).await;
             }
 
-            // Final browser fallback for stubborn pages/challenges.
-            if should_retry_scrape_page(current_page.as_ref(), require_substantive) {
+            let need_final_browser = match crawl_mode {
+                CrawlMode::Auto => {
+                    if let Some(r) = http_auto_fallback_reason(
+                        current_page.as_ref(),
+                        require_substantive,
+                        &auto_policy,
+                        wait_sel,
+                        req_text,
+                    ) {
+                        fallback_reason = r;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                CrawlMode::Http => {
+                    http_retry_for_fetch_attempt(current_page.as_ref(), require_substantive)
+                }
+                CrawlMode::Browser => false,
+            };
+
+            if need_final_browser {
+                if matches!(crawl_mode, CrawlMode::Http) {
+                    fallback_reason = if current_page.as_ref().is_some_and(|p| {
+                        scrape_contract::html_challenge_markers_hit(&p.get_html())
+                    }) {
+                        FallbackReason::HttpChallenge
+                    } else if current_page
+                        .as_ref()
+                        .is_some_and(|p| !p.status_code.is_success())
+                    {
+                        FallbackReason::HttpBadStatus
+                    } else {
+                        FallbackReason::HttpLowWords
+                    };
+                }
                 let browser_website = build_scrape_website(
                     &payload.url,
                     request_timeout_secs,
@@ -747,44 +1152,137 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
                     AntiBotProfile::CamoufoxLike,
                     payload.browser.as_ref(),
                     &CrawlMode::Browser,
+                    wait_sel,
                 );
                 if let Some(browser_page) = fetch_single_page_browser(browser_website).await {
-                    mode_used = CrawlMode::Browser;
+                    used_browser = true;
                     current_page = Some(browser_page);
-                } else {
-                    mode_used = if matches!(crawl_mode, CrawlMode::Auto) {
-                        CrawlMode::Auto
-                    } else {
-                        CrawlMode::Http
-                    };
                 }
-            } else {
-                mode_used = CrawlMode::Http;
             }
 
             current_page
         }
     };
+
     let elapsed_ms = start.elapsed().as_millis() as u64;
     if let Some(host) = host_key.as_deref() {
-        let failed = should_retry_scrape_page(page.as_ref(), require_substantive);
+        let failed = page
+            .as_ref()
+            .map(|p| http_retry_for_fetch_attempt(Some(p), require_substantive))
+            .unwrap_or(true);
         update_domain_failure_memory(state, host, failed).await;
     }
 
-    Ok(ScrapeResponse {
-        root_url: payload.url,
-        scrape_duration_ms: elapsed_ms,
-        mode_used,
-        page: page.as_ref().map(|value| {
+    let mode_used = effective_crawl_mode(&crawl_mode, used_browser);
+    let content_type = page
+        .as_ref()
+        .map(|p| scrape_contract::content_type_from_headers(p.headers.as_ref()))
+        .unwrap_or_default();
+    let unsupported = page
+        .as_ref()
+        .is_some_and(|_| scrape_contract::classify_content_type(&content_type).is_err());
+
+    let fit_opts = fit_markdown::resolve_fit_options(payload.extraction_profile, &payload.fit_markdown);
+    let crawled_page = if unsupported {
+        None
+    } else {
+        page.as_ref().map(|value| {
             map_page(
                 value,
                 include_content,
                 max_content_chars,
                 Some(&response_format),
                 want_markdown,
-                &payload.fit_markdown,
+                &fit_opts,
             )
-        }),
+        })
+    };
+    let title = page
+        .as_ref()
+        .and_then(|p| scrape_contract::extract_title_from_html(&p.get_html()));
+    let content = crawled_page.as_ref().and_then(|c| c.content.clone());
+    let markdown = crawled_page.as_ref().and_then(|c| {
+        c.markdown.as_ref().map(|m| MarkdownSection {
+            raw_markdown: m.raw_markdown.clone(),
+            fit_markdown: m.fit_markdown.clone(),
+            fit_html: m.fit_html.clone(),
+        })
+    });
+
+    let signals = if unsupported {
+        ScrapeSignals {
+            word_count: 0,
+            char_count: 0,
+            unique_word_ratio: 0.0,
+            boilerplate_ratio: 0.0,
+            link_density: 0.0,
+            heading_count: 0,
+            code_block_count: 0,
+            link_count: 0,
+            content_density: 0.0,
+            main_content_score: 0.0,
+            blocked_likelihood: 0.0,
+            fallback_reason: FallbackReason::HttpUnsupportedContentType,
+            truncated: false,
+            language: None,
+        }
+    } else if let Some(p) = page.as_ref() {
+        let html = p.get_html();
+        let links = link_count_for_page(p, &html);
+        let main = fit_markdown::quick_main_content_score(&html);
+        let fb = if used_browser {
+            fallback_reason
+        } else {
+            FallbackReason::None
+        };
+        scrape_contract::build_signals(
+            p,
+            &html,
+            links,
+            main,
+            fb,
+            p.content_truncated,
+        )
+    } else {
+        ScrapeSignals {
+            word_count: 0,
+            char_count: 0,
+            unique_word_ratio: 0.0,
+            boilerplate_ratio: 0.0,
+            link_density: 0.0,
+            heading_count: 0,
+            code_block_count: 0,
+            link_count: 0,
+            content_density: 0.0,
+            main_content_score: 0.0,
+            blocked_likelihood: 0.0,
+            fallback_reason: FallbackReason::HttpEmpty,
+            truncated: false,
+            language: None,
+        }
+    };
+
+    let error = build_scrape_error(
+        page.as_ref(),
+        crawled_page.as_ref(),
+        want_markdown,
+        &content_type,
+        unsupported,
+    );
+
+    Ok(ScrapeResponse {
+        root_url: payload.url.clone(),
+        final_url: page.as_ref().map(|p| p.get_url_final().to_string()),
+        status_code: page.as_ref().map(|p| p.status_code.as_u16()),
+        content_type,
+        duration_ms: elapsed_ms,
+        mode_used,
+        content,
+        markdown,
+        title,
+        error,
+        signals,
+        page: crawled_page,
     })
 }
 
@@ -802,14 +1300,16 @@ fn build_scrape_website(
     anti_bot_profile: AntiBotProfile,
     browser: Option<&BrowserModeConfig>,
     crawl_mode: &CrawlMode,
+    wait_for_selector: Option<&str>,
 ) -> Website {
+    let (req_t, crawl_t) = effective_browser_timeouts(browser, request_timeout_secs, crawl_timeout_secs);
     let mut website = Website::new(url);
     website
         .with_depth(0)
         .with_limit(1)
         .with_concurrency_limit(Some(1))
-        .with_request_timeout(Some(Duration::from_secs(request_timeout_secs)))
-        .with_crawl_timeout(Some(Duration::from_secs(crawl_timeout_secs)))
+        .with_request_timeout(Some(Duration::from_secs(req_t)))
+        .with_crawl_timeout(Some(Duration::from_secs(crawl_t)))
         .with_respect_robots_txt(respect_robots_txt)
         .with_subdomains(false)
         .with_redirect_limit(redirect_limit)
@@ -829,57 +1329,78 @@ fn build_scrape_website(
     }
     apply_anti_bot_profile(&mut website, anti_bot_profile);
     configure_browser_mode(&mut website, browser, crawl_mode);
+    apply_browser_wait_options(
+        &mut website,
+        browser,
+        wait_for_selector,
+        req_t,
+        crawl_t,
+    );
 
     website
 }
 
-fn should_retry_scrape_page(page: Option<&Page>, require_content: bool) -> bool {
-    let Some(page) = page else {
-        return true;
+fn effective_browser_timeouts(
+    browser: Option<&BrowserModeConfig>,
+    request_timeout_secs: u64,
+    crawl_timeout_secs: u64,
+) -> (u64, u64) {
+    let Some(b) = browser else {
+        return (request_timeout_secs, crawl_timeout_secs);
     };
-
-    let status = page.status_code.as_u16();
-    if matches!(status, 403 | 407 | 408 | 409 | 410 | 425 | 429 | 451) || status >= 500 {
-        return true;
-    }
-
-    let html = page.get_html();
-    let html_trimmed = html.trim();
-    if require_content && html_trimmed.is_empty() {
-        return true;
-    }
-
-    if is_challenge_or_block_page(html_trimmed) {
-        return true;
-    }
-
-    if require_content {
-        let text = html_to_text(html_trimmed);
-        let token_count = text.split_whitespace().count();
-        if html_trimmed.len() < 512 || token_count < 40 {
-            return true;
-        }
-    }
-
-    false
+    let req_t = b
+        .page_timeout_secs
+        .map(|p| p.clamp(1, request_timeout_secs.max(1)))
+        .unwrap_or(request_timeout_secs);
+    let crawl_t = b
+        .page_timeout_secs
+        .map(|p| p.clamp(1, crawl_timeout_secs.max(1)))
+        .unwrap_or(crawl_timeout_secs);
+    (req_t, crawl_t)
 }
 
-fn is_challenge_or_block_page(html: &str) -> bool {
-    let content = html.to_ascii_lowercase();
-    let markers = [
-        "cloudflare",
-        "captcha",
-        "access denied",
-        "verify you are a human",
-        "attention required",
-        "datadome",
-        "akamai",
-        "bot detection",
-        "security check",
-        "please enable javascript and cookies",
-        "oops!! something went wrong",
-    ];
-    markers.iter().any(|marker| content.contains(marker))
+fn apply_browser_wait_options(
+    website: &mut Website,
+    browser: Option<&BrowserModeConfig>,
+    wait_for_selector: Option<&str>,
+    request_timeout_secs: u64,
+    crawl_timeout_secs: u64,
+) {
+    if let Some(sel) = wait_for_selector.filter(|s| !s.is_empty()) {
+        let t = browser
+            .and_then(|b| b.wait_for_selector_timeout_secs)
+            .unwrap_or(30)
+            .max(1);
+        website.with_wait_for_selector(Some(WaitForSelector::new(
+            Some(Duration::from_secs(t)),
+            sel.to_string(),
+        )));
+    }
+    let Some(b) = browser else {
+        return;
+    };
+    if let Some(ms) = b.wait_ms_after_load.filter(|v| *v > 0) {
+        website.with_wait_for_delay(Some(WaitForDelay::new(Some(Duration::from_millis(ms)))));
+    }
+    match b.wait_for_load.as_deref().map(|s| s.to_ascii_lowercase()) {
+        Some(ref s) if s == "networkidle" => {
+            website.with_wait_for_idle_network(Some(WaitForIdleNetwork::new(Some(
+                Duration::from_secs(crawl_timeout_secs.max(5)),
+            ))));
+        }
+        Some(ref s) if s == "load" => {
+            website.with_wait_for_almost_idle_network0(Some(WaitForIdleNetwork::new(Some(
+                Duration::from_secs(request_timeout_secs.max(3)),
+            ))));
+        }
+        _ => {}
+    }
+    if let (Some(w), Some(h)) = (b.viewport_width, b.viewport_height) {
+        website.with_viewport(Some(Viewport::new(w, h)));
+    }
+    if b.screenshot != Some(true) {
+        website.with_screenshot(None);
+    }
 }
 
 async fn domain_should_force_browser(state: &AppState, host: &str) -> bool {
@@ -1003,6 +1524,9 @@ fn configure_browser_mode(
         }
         if let Some(value) = config.block_analytics {
             intercept.block_analytics = value;
+        }
+        if let Some(enabled) = config.javascript_enabled {
+            intercept.block_javascript = !enabled;
         }
         website.with_chrome_intercept(intercept);
     } else {

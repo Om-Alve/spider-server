@@ -144,9 +144,15 @@ def run_spider_server(
         data = response.json()
 
         page = data.get("page")
-        page_content = (page or {}).get("content", "") if isinstance(page, dict) else ""
-        title = normalize_title(extract_title_from_html(page_content)) if page_content else None
-        links_extracted = int((page or {}).get("links_extracted", 0)) if isinstance(page, dict) else 0
+        page_content = data.get("content")
+        if not isinstance(page_content, str):
+            page_content = (page or {}).get("content", "") if isinstance(page, dict) else ""
+        title = normalize_title(data.get("title"))
+        if title is None and page_content:
+            title = normalize_title(extract_title_from_html(page_content))
+        links_extracted = int(data.get("signals", {}).get("link_count", 0))
+        if links_extracted == 0 and isinstance(page, dict):
+            links_extracted = int(page.get("links_extracted", 0))
 
         return RunResult(
             tool="spider-server",

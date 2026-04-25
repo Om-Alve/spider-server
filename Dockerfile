@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.87-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
@@ -8,7 +8,6 @@ COPY src ./src
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
     cargo build --release
 
 FROM debian:bookworm-slim AS runtime
