@@ -967,17 +967,41 @@ fn approximate_visible_token_count(html: &str) -> usize {
 fn is_challenge_or_block_page(html: &str) -> bool {
     let content = html.to_ascii_lowercase();
     let markers = [
-        "cloudflare",
         "captcha",
         "access denied",
         "verify you are a human",
+        "verify you are human",
         "attention required",
         "datadome",
-        "akamai",
+        "akamai bot manager",
         "bot detection",
         "security check",
         "please enable javascript and cookies",
+        "please enable cookies and reload",
         "oops!! something went wrong",
+        // Cloudflare challenge variants. Plain "cloudflare" matches too many
+        // legitimate pages; require it to co-occur with other challenge cues.
+        "checking if the site connection is secure",
+        "ddos protection by cloudflare",
+        // Imperva / Incapsula stub pages — extremely small bodies that ship
+        // an Incapsula JS challenge and otherwise look like 200 OK.
+        "_incapsula_resource",
+        "incapsula incident id",
+        // Anubis Proof-of-Work challenge used by some FOSS sites.
+        "making sure you're not a bot",
+        "anubis-version",
+        // SPA "JavaScript required" stubs — zero useful content for an HTTP
+        // scraper, retrying with a different identity rarely helps but at
+        // least flags them so callers can fall back to browser mode.
+        "you need to enable javascript to run this app",
+        "this website requires javascript",
+        "please enable javascript to view",
+        "javascript is required to use",
+        // PerimeterX and friends.
+        "perimeterx",
+        "px-captcha",
+        // Sucuri.
+        "sucuri website firewall",
     ];
     markers.iter().any(|marker| content.contains(marker))
 }
@@ -1006,11 +1030,36 @@ fn map_page(
     max_content_chars: usize,
     response_format: Option<&ScrapeResponseFormat>,
 ) -> CrawledPage {
+    // PDF fast path: if the response body looks like a PDF, render it via
+    // pdf_extract regardless of the requested format. The HTML pipeline
+    // returns binary garbage for PDFs; emitting the extracted plain text is
+    // both more useful for downstream consumers and orders of magnitude
+    // closer to ground truth on the scrape-evals dataset.
+    let raw_bytes_slice = page.get_bytes();
+    let is_pdf = raw_bytes_slice
+        .map(|b| b.starts_with(b"%PDF-"))
+        .unwrap_or(false);
+    if is_pdf && include_content {
+        let bytes = raw_bytes_slice.unwrap_or(&[]);
+        let pdf_text = pdf_extract::extract_text_from_mem(bytes).unwrap_or_default();
+        let trimmed = take_chars(pdf_text.trim(), max_content_chars);
+        let error = page.error_status.as_ref().map(ToString::to_string);
+        return CrawledPage {
+            url: page.get_url().to_owned(),
+            final_url: page.get_url_final().to_owned(),
+            status_code: page.status_code.as_u16(),
+            bytes: bytes.len(),
+            links_extracted: 0,
+            error,
+            content: Some(trimmed),
+        };
+    }
+
     // Borrow the HTML once. `get_html_cow` returns a borrowed slice for the
     // common UTF-8 case so we avoid the per-call allocation done by
     // `get_html()`. The actual byte count comes from the underlying buffer
     // directly, which avoids re-encoding non-UTF-8 content twice.
-    let raw_bytes = page.get_bytes().map(<[u8]>::len).unwrap_or(0);
+    let raw_bytes = raw_bytes_slice.map(<[u8]>::len).unwrap_or(0);
     let html_cow = include_content.then(|| page.get_html_cow());
 
     let content = html_cow.as_ref().map(|value| {
@@ -1309,43 +1358,62 @@ fn html_to_text(html: &str) -> String {
     html2text::from_read(Cursor::new(html.as_bytes()), width).unwrap_or_else(|_| html.to_string())
 }
 
+/// Render the document body into text. We first strip a small allowlist of
+/// definitely-not-content elements (cookie banners, modals, popups, scripts,
+/// styles, iframes) via a streaming HTML rewriter, then look for a strong
+/// `<article>`/`<main>`/`[role=main]` candidate. If none is found we render
+/// the cleaned body. As a last resort we fall back to the raw HTML — this is
+/// only used when both prior passes returned essentially empty content.
 fn html_to_main_text(html: &str) -> String {
-    let Some(main_html) = extract_primary_html_block(html) else {
-        return html_to_text(html);
-    };
-    let focused = html_to_text(&main_html);
-    let focused_tokens = focused.split_whitespace().count();
+    let cleaned = strip_boilerplate_html(html).unwrap_or_else(|| html.to_string());
 
-    // Cheap heuristic: if the focused fragment's source HTML covers a large
-    // fraction of the document, trust the extraction without rendering the
-    // full document a second time.
-    if focused_tokens >= 120 && main_html.len() * 10 >= html.len().saturating_mul(4) {
-        return focused;
+    // Try to find a strong primary block first. We only trust it when it has
+    // a substantial token count AND covers a non-trivial fraction of the
+    // cleaned document — that combination keeps obvious cookie/nav widgets
+    // from being mistaken for the main content.
+    if let Some(primary) = extract_primary_html_block(&cleaned) {
+        let primary_text = html_to_text(&primary);
+        let primary_tokens = primary_text.split_whitespace().count();
+        if primary_tokens >= 80 && primary.len() * 5 >= cleaned.len() {
+            return primary_text;
+        }
+        // If the primary block is short but the rest of the doc is ALSO
+        // short, take it — some pages legitimately have small main blocks.
+        let cleaned_text = html_to_text(&cleaned);
+        let cleaned_tokens = cleaned_text.split_whitespace().count();
+        if primary_tokens >= 40 && cleaned_tokens.saturating_sub(primary_tokens) <= 40 {
+            return primary_text;
+        }
+        if cleaned_tokens >= 40 {
+            return cleaned_text;
+        }
     }
 
-    let full = html_to_text(html);
-    let full_tokens = full.split_whitespace().count();
-    if focused_tokens >= 120
-        && (full_tokens == 0 || focused_tokens * 10 >= full_tokens.saturating_mul(4))
-    {
-        focused
-    } else {
-        full
+    let cleaned_text = html_to_text(&cleaned);
+    let cleaned_tokens = cleaned_text.split_whitespace().count();
+    if cleaned_tokens >= 40 {
+        return cleaned_text;
     }
+
+    html_to_text(html)
 }
 
+/// Look for the strongest `<article>` / `<main>` / `[role=main]` block in
+/// the document. Returns the HTML fragment of the candidate with the most
+/// text tokens. Selectors that match overly-broad classes (anything
+/// containing "content", "article", etc.) are intentionally not used here:
+/// they were the cause of cookie-banner extractions being mistaken for the
+/// main content on many sites.
 fn extract_primary_html_block(html: &str) -> Option<String> {
     let doc = Html::parse_document(html);
     let selectors = [
         "article",
         "main",
         "[role=main]",
-        "section[id*=content]",
-        "div[id*=content]",
-        "section[class*=content]",
-        "div[class*=content]",
-        "section[class*=article]",
-        "div[class*=article]",
+        "article[id]",
+        "div[itemtype*=Article]",
+        "div[itemtype*=NewsArticle]",
+        "div[itemtype*=BlogPosting]",
     ];
 
     let mut best: Option<(usize, String)> = None;
@@ -1356,7 +1424,7 @@ fn extract_primary_html_block(html: &str) -> Option<String> {
         for element in doc.select(&selector) {
             let text = element.text().collect::<Vec<_>>().join(" ");
             let token_count = text.split_whitespace().count();
-            if token_count < 40 {
+            if token_count < 60 {
                 continue;
             }
             let html_fragment = element.html();
@@ -1369,6 +1437,92 @@ fn extract_primary_html_block(html: &str) -> Option<String> {
 
     best.map(|(_, fragment)| fragment)
 }
+
+/// Strip a conservative set of structural noise (scripts/styles/iframes/
+/// non-content widgets) and a small allowlist of definitely-not-article
+/// elements (cookie banners, modal overlays, popup signups). The removal
+/// list is intentionally narrow because matching by class/id keywords is
+/// noisy — e.g. legitimate article wrappers often use class names like
+/// `article-header`, `post-footer`, `comments-section`, etc., that look
+/// like boilerplate.
+fn strip_boilerplate_html(html: &str) -> Option<String> {
+    let mut output: Vec<u8> = Vec::with_capacity(html.len());
+    let result = {
+        let drop_handler = |el: &mut lol_html::html_content::Element| {
+            el.remove();
+            Ok(())
+        };
+        let conditional_handler = |el: &mut lol_html::html_content::Element| {
+            let id = el.get_attribute("id").unwrap_or_default();
+            let class = el.get_attribute("class").unwrap_or_default();
+            let combined = format!("{id} {class}").to_ascii_lowercase();
+            if BOILERPLATE_TOKENS.iter().any(|tok| combined.contains(tok)) {
+                el.remove();
+            }
+            Ok(())
+        };
+
+        let mut rewriter = HtmlRewriter::new(
+            Settings {
+                element_content_handlers: vec![
+                    element!("script", drop_handler),
+                    element!("style", drop_handler),
+                    element!("noscript", drop_handler),
+                    element!("template", drop_handler),
+                    element!("svg", drop_handler),
+                    element!("iframe", drop_handler),
+                    element!("button", drop_handler),
+                    // Definite chrome via ARIA roles. We deliberately do NOT
+                    // strip <nav>/<header>/<footer>/<aside> tags because some
+                    // sites rely on them inside the article body.
+                    element!("[role=dialog]", drop_handler),
+                    element!("[role=alertdialog]", drop_handler),
+                    element!("[aria-hidden=true]", drop_handler),
+                    element!("[hidden]", drop_handler),
+                    element!("div", conditional_handler),
+                    element!("section", conditional_handler),
+                    element!("aside", conditional_handler),
+                ],
+                ..Settings::default()
+            },
+            |chunk: &[u8]| output.extend_from_slice(chunk),
+        );
+        rewriter.write(html.as_bytes()).and_then(|_| rewriter.end())
+    };
+    if result.is_err() {
+        return None;
+    }
+    String::from_utf8(output).ok()
+}
+
+/// Tokens that, when they appear as a delimited word inside a `class` or `id`,
+/// strongly indicate non-article chrome. Keep this list intentionally short
+/// and unambiguous — adding broad tokens like `header`, `footer`, `nav`,
+/// `share`, `comments`, `related`, `banner`, `tracking`, `alert`, or `tab`
+/// caused large recall regressions on the scrape-evals dataset because real
+/// article wrappers often contain those words too.
+const BOILERPLATE_TOKENS: &[&str] = &[
+    "cookie-banner",
+    "cookie-notice",
+    "cookie-consent",
+    "cookieconsent",
+    "consent-banner",
+    "gdpr-banner",
+    "ccpa",
+    "popup-overlay",
+    "modal-overlay",
+    "lightbox-overlay",
+    "newsletter-popup",
+    "newsletter-signup",
+    "subscribe-popup",
+    "skip-link",
+    "skip-to-content",
+    "back-to-top",
+    "scroll-top",
+    "sucuri",
+    "incapsula",
+];
+
 
 /// Count anchors with non-empty `href` using a streaming HTML rewriter.
 /// This avoids building a full DOM (which `scraper`/`html5ever` does) and is
@@ -1635,10 +1789,15 @@ fn build_camoufox_headers(
     let dnt = config.and_then(|c| c.do_not_track).unwrap_or(true);
     let platform = camoufox_platform_hint(user_agent, config.and_then(|c| c.platform.as_deref()));
 
+    // Note: we deliberately do NOT set Accept-Encoding here. spider-rs's
+    // bundled reqwest enables gzip/brotli/deflate/zstd features (so reqwest
+    // already auto-decompresses transparently when the server compresses).
+    // Pinning Accept-Encoding from this layer would risk overriding reqwest's
+    // capability negotiation and returning raw compressed bytes for some
+    // backend configurations.
     let entries: &[(&str, &str)] = &[
         ("accept", accept),
         ("accept-language", language),
-        ("accept-encoding", "gzip, deflate, br, zstd"),
         ("upgrade-insecure-requests", "1"),
         ("sec-fetch-dest", "document"),
         ("sec-fetch-mode", "navigate"),

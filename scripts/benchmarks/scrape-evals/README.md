@@ -21,21 +21,49 @@ For reference, the published `scrape-evals` README lists e.g.
 - Settings: `crawl_mode=http`, `anti_bot_profile=camoufox_stealth`,
   `response_format=text` (rendered as markdown by `html2text`),
   `respect_robots_txt=false`, `max_workers=24`
-- End-to-end wall time: ~5m 36s
+- End-to-end wall time: ~5–6m
 
 ```json
 {
-  "success_rate": 0.72,
-  "avg_recall": 0.5048,
-  "avg_precision": 0.4980,
-  "avg_f1": 0.4958
+  "success_rate": 0.717,
+  "avg_recall":   0.522,
+  "avg_precision":0.517,
+  "avg_f1":       0.513
 }
 ```
 
+Note the dataset has a hard ceiling: 135 of the 1,000 rows have empty
+`truth_text` AND empty `lie_text`, which the official analyzer hard-codes to
+`success=False`. So **0.865** is the maximum achievable coverage on this
+dataset, not 1.0. Our 0.717 is therefore ~83% of that ceiling.
+
 For comparison the `response_format=html` variant (raw HTML) on the same set
-scored `0.547 / 0.407` — markdown extraction wins clearly because the F1
-analyzer scores against a human-text snippet, so passing back script tags and
-boilerplate hurts precision.
+scored `0.547 / 0.407` — text-with-boilerplate-stripping wins clearly because
+the F1 analyzer scores against a human-text snippet, so passing back script
+tags and boilerplate hurts precision.
+
+### What changed since the first run
+
+- HTTP body is now reliably decompressed — we used to send
+  `Accept-Encoding: gzip, deflate, br, zstd` from the camoufox layer, which
+  on some upstreams returned raw compressed bytes that the rest of the
+  pipeline could not parse.
+- Boilerplate (cookie banners, modal overlays, popup signups, scripts,
+  styles, dialogs, sucuri/incapsula stubs) is stripped via a streaming
+  `lol_html` pass before text rendering. The keyword list is intentionally
+  narrow — broad tokens like `header`, `footer`, `nav`, `share`, `comments`,
+  `banner`, `tab` regressed many real article wrappers when tried.
+- Strong primary-content extraction is restricted to `<article>`, `<main>`,
+  `[role=main]`, and Schema.org `[itemtype*=Article|NewsArticle|BlogPosting]`,
+  with a token-density gate. Generic `[class*=content]` matches were dropped
+  — they were the cause of cookie-banner extractions being mistaken for the
+  main content.
+- PDFs are detected by their `%PDF-` magic bytes and rendered to plain text
+  via `pdf-extract`. 17 PDFs in the dataset previously scored ~0.0; most now
+  score in the 0.9–1.0 band.
+- Challenge / block-page detection now also matches Incapsula stubs, Anubis
+  Proof-of-Work pages, PerimeterX/PX-CAPTCHA, Sucuri WAF, and the most
+  common SPA "JavaScript required" stubs.
 
 ## Reproduce
 
