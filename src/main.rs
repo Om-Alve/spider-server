@@ -1,3 +1,5 @@
+mod fit_markdown;
+
 use std::{
     collections::HashMap,
     fs,
@@ -75,6 +77,11 @@ struct CrawlRequest {
     respect_robots_txt: Option<bool>,
     subdomains: Option<bool>,
     include_content: Option<bool>,
+    /// When true, each [`CrawledPage`] may include a [`CrawledPage::markdown`] block (heavier).
+    include_markdown: Option<bool>,
+    /// Pruning for fit markdown; ignored if `include_markdown` is false.
+    #[serde(default)]
+    fit_markdown: fit_markdown::FitMarkdownOptions,
     max_content_chars: Option<usize>,
     proxies: Option<Vec<String>>,
     anti_bot_profile: Option<AntiBotProfile>,
@@ -114,6 +121,10 @@ struct ScrapeRequest {
     crawl_mode: Option<CrawlMode>,
     browser: Option<BrowserModeConfig>,
     response_format: Option<ScrapeResponseFormat>,
+    /// Set true to return [`CrawledPage::markdown`] with `raw_markdown` and `fit_markdown` (Crawl4AI-style).
+    include_markdown: Option<bool>,
+    #[serde(default)]
+    fit_markdown: fit_markdown::FitMarkdownOptions,
 }
 
 #[derive(Debug, Serialize)]
@@ -151,6 +162,9 @@ struct CrawledPage {
     links_extracted: usize,
     error: Option<String>,
     content: Option<String>,
+    /// Crawl4AI-style markdown: full `raw_markdown` + pruned `fit_markdown` + `fit_html`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    markdown: Option<fit_markdown::FitMarkdown>,
 }
 
 #[derive(Debug, Serialize)]
@@ -197,6 +211,8 @@ enum CrawlMode {
 enum ScrapeResponseFormat {
     Html,
     Text,
+    /// HTML→Markdown for LLM use, with a pruned `fit_markdown` like Crawl4AI.
+    Markdown,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -462,6 +478,7 @@ async fn crawl_once(state: &AppState, payload: CrawlRequest) -> Result<CrawlResp
         state.config.max_content_chars,
     );
     let include_content = payload.include_content.unwrap_or(false);
+    let include_markdown = payload.include_markdown.unwrap_or(false);
     let redirect_limit = payload.redirect_limit.unwrap_or(10);
     let proxies = resolve_request_proxies(payload.proxies, state)?;
     let crawl_mode = payload.crawl_mode.clone().unwrap_or(CrawlMode::Http);
@@ -520,6 +537,8 @@ async fn crawl_once(state: &AppState, payload: CrawlRequest) -> Result<CrawlResp
                 include_content,
                 max_content_chars,
                 None,
+                include_markdown,
+                &payload.fit_markdown,
             )],
         });
     }
@@ -530,7 +549,16 @@ async fn crawl_once(state: &AppState, payload: CrawlRequest) -> Result<CrawlResp
         .map(|spider_pages| {
             spider_pages
                 .iter()
-                .map(|page| map_page(page, include_content, max_content_chars, None))
+                .map(|page| {
+                    map_page(
+                        page,
+                        include_content,
+                        max_content_chars,
+                        None,
+                        include_markdown,
+                        &payload.fit_markdown,
+                    )
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -578,6 +606,9 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
     let response_format = payload
         .response_format
         .unwrap_or(ScrapeResponseFormat::Text);
+    let want_markdown = payload.include_markdown == Some(true)
+        || matches!(response_format, ScrapeResponseFormat::Markdown);
+    let require_substantive = include_content || want_markdown;
     let redirect_limit = payload.redirect_limit.unwrap_or(10);
     let crawl_mode = payload.crawl_mode.clone().unwrap_or(CrawlMode::Http);
     let respect_robots_txt = payload.respect_robots_txt.unwrap_or(true);
@@ -638,7 +669,7 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
 
             // Primary HTTP attempt.
             if current_page.is_none()
-                || should_retry_scrape_page(current_page.as_ref(), include_content)
+                || should_retry_scrape_page(current_page.as_ref(), require_substantive)
             {
                 let http_website = build_scrape_website(
                     &payload.url,
@@ -658,7 +689,7 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
             }
 
             // Retry with a rotated proxy batch when defaults are in use.
-            if should_retry_scrape_page(current_page.as_ref(), include_content) {
+            if should_retry_scrape_page(current_page.as_ref(), require_substantive) {
                 if !has_explicit_proxies && !state.config.default_proxies.is_empty() {
                     selected_proxies = resolve_request_proxies(None, state)?;
                 }
@@ -680,7 +711,7 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
             }
 
             // Hardened retry with camoufox-like profile.
-            if should_retry_scrape_page(current_page.as_ref(), include_content) {
+            if should_retry_scrape_page(current_page.as_ref(), require_substantive) {
                 if !has_explicit_proxies && !state.config.default_proxies.is_empty() {
                     selected_proxies = resolve_request_proxies(None, state)?;
                 }
@@ -702,7 +733,7 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
             }
 
             // Final browser fallback for stubborn pages/challenges.
-            if should_retry_scrape_page(current_page.as_ref(), include_content) {
+            if should_retry_scrape_page(current_page.as_ref(), require_substantive) {
                 let browser_website = build_scrape_website(
                     &payload.url,
                     request_timeout_secs,
@@ -736,7 +767,7 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
     };
     let elapsed_ms = start.elapsed().as_millis() as u64;
     if let Some(host) = host_key.as_deref() {
-        let failed = should_retry_scrape_page(page.as_ref(), include_content);
+        let failed = should_retry_scrape_page(page.as_ref(), require_substantive);
         update_domain_failure_memory(state, host, failed).await;
     }
 
@@ -750,11 +781,14 @@ async fn scrape_once(state: &AppState, payload: ScrapeRequest) -> Result<ScrapeR
                 include_content,
                 max_content_chars,
                 Some(&response_format),
+                want_markdown,
+                &payload.fit_markdown,
             )
         }),
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_scrape_website(
     url: &str,
     request_timeout_secs: u64,
@@ -871,40 +905,76 @@ fn map_page(
     include_content: bool,
     max_content_chars: usize,
     response_format: Option<&ScrapeResponseFormat>,
+    want_markdown: bool,
+    fit_options: &fit_markdown::FitMarkdownOptions,
 ) -> CrawledPage {
-    let html = include_content.then(|| page.get_html());
-    let content = html.as_ref().map(|value| {
-        let rendered = match response_format.unwrap_or(&ScrapeResponseFormat::Html) {
-            ScrapeResponseFormat::Html => value.to_string(),
+    let fmt = response_format.unwrap_or(&ScrapeResponseFormat::Html);
+    let full_html = page.get_html();
+    let markdown = if want_markdown {
+        fit_markdown::build_fit_markdown(&full_html, fit_options)
+            .ok()
+            .map(|mut m| {
+                m.raw_markdown = m
+                    .raw_markdown
+                    .chars()
+                    .take(max_content_chars)
+                    .collect();
+                m.fit_markdown = m
+                    .fit_markdown
+                    .chars()
+                    .take(max_content_chars)
+                    .collect();
+                m.fit_html = m.fit_html.chars().take(max_content_chars).collect();
+                m
+            })
+    } else {
+        None
+    };
+
+    let content = if !include_content {
+        None
+    } else {
+        let rendered = match fmt {
+            ScrapeResponseFormat::Html => full_html.to_string(),
             ScrapeResponseFormat::Text => {
-                let focused = html_to_main_text(value);
+                let focused = html_to_main_text(&full_html);
                 if focused.split_whitespace().count() < 40 {
-                    html_to_text(value)
+                    html_to_text(&full_html)
                 } else {
                     focused
                 }
             }
+            ScrapeResponseFormat::Markdown => {
+                if let Some(ref m) = markdown {
+                    m.fit_markdown.chars().take(max_content_chars).collect()
+                } else {
+                    html_to_text(&full_html)
+                }
+            }
         };
-        rendered.chars().take(max_content_chars).collect::<String>()
-    });
+        Some(rendered)
+    };
 
     let error = page.error_status.as_ref().map(ToString::to_string);
     let links_extracted = page.page_links.as_ref().map_or_else(
-        || count_links_from_html(&page.get_html()),
+        || count_links_from_html(&full_html),
         |links| links.len(),
     );
+    let bytes = if include_content {
+        full_html.len()
+    } else {
+        page.get_bytes().map_or(0, |b| b.len())
+    };
 
     CrawledPage {
         url: page.get_url().to_owned(),
         final_url: page.get_url_final().to_owned(),
         status_code: page.status_code.as_u16(),
-        bytes: html.as_ref().map_or_else(
-            || page.get_bytes().map_or(0, |bytes| bytes.len()),
-            |value| value.len(),
-        ),
+        bytes,
         links_extracted,
         error,
         content,
+        markdown,
     }
 }
 
@@ -1188,8 +1258,7 @@ fn normalize_proxies(
 
     if normalized.len() > max_proxies {
         return Err(ApiError::bad_request(format!(
-            "proxy list exceeds configured maximum: {}",
-            max_proxies
+            "proxy list exceeds configured maximum: {max_proxies}"
         )));
     }
 

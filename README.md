@@ -69,7 +69,12 @@ Request fields:
 - `redirect_limit` (optional): max redirects
 - `crawl_mode` (optional): `http`, `browser`, `auto`
 - `browser` (optional): same browser options as `/crawl`
-- `response_format` (optional): `html` or `text` (default: `text`)
+- `response_format` (optional): `html`, `text`, or `markdown` (default: `text`). With `markdown`, the page includes Crawl4AI–style `raw_markdown` and pruned `fit_markdown` for LLM / RAG use
+- `include_markdown` (optional): if `true`, the same `markdown` object is returned in addition to `html` or `text` (ignored when `response_format` is already `markdown`, which always includes it)
+- `fit_markdown` (optional, object, defaults for omitted fields):
+  - `pruning_threshold` (float, default `0.48`) — min composite score to keep a subtree; higher → more aggressive pruning
+  - `pruning_type` (optional): `fixed` or `dynamic` (Crawl4AI’s threshold adjustment by tag and link density; default `fixed`)
+  - `min_word_threshold` (optional, default `5` per block; set `null` to disable)
 
 Response (shape):
 
@@ -85,10 +90,17 @@ Response (shape):
     "bytes": 42137,
     "links_extracted": 14,
     "error": null,
-    "content": "<!doctype html>..."
+    "content": "<!doctype html>...",
+    "markdown": {
+      "raw_markdown": "...",
+      "fit_markdown": "...",
+      "fit_html": "..."
+    }
   }
 }
 ```
+
+`markdown` is present only when `include_markdown` is true, or when `response_format` is `markdown`. The `content` string uses `fit_markdown` when `response_format` is `markdown` and `include_content` is true.
 
 ### Crawl
 
@@ -133,6 +145,8 @@ Request fields:
 - `respect_robots_txt` (optional, default true)
 - `subdomains` (optional, default false)
 - `include_content` (optional, default false)
+- `include_markdown` (optional, default false): if true, each `page` may include a `markdown` object (same shape as `/scrape`)
+- `fit_markdown` (optional, same as `/scrape`): pruning options when `include_markdown` is true
 - `max_content_chars` (optional)
 - `proxies` (optional): list of `http://`, `https://`, `socks5://`, or `socks5h://` proxies
 - `anti_bot_profile` (optional): `off`, `basic`, or `camoufox_like`
