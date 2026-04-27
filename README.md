@@ -249,7 +249,8 @@ Environment variables:
 
 You can drop a `proxy.txt` file in the project root (or set `PROXY_FILE` to another path),
 and the server will automatically use those proxies for rotation when a request does not include
-its own `proxies` list.
+its own `proxies` list. With **Docker Compose**, use the mounted `docker-proxy/` directory instead
+(see [Docker Compose](#docker-compose) below).
 
 Supported line formats:
 
@@ -290,6 +291,27 @@ docker run --rm -p 8080:8080 spider-server:latest
 
 ```bash
 docker compose up --build -d
+```
+
+The Compose file mounts a host directory at `/proxy` inside the container and sets `PROXY_FILE` to
+`/proxy/proxy.txt`. To supply proxies:
+
+1. Create `docker-proxy/proxy.txt` next to `docker-compose.yml` (Compose creates `docker-proxy/` if it is missing).
+2. Add newline-separated entries using the same formats as [Automatic proxy rotation from `proxy.txt`](#automatic-proxy-rotation-from-proxytxt).
+
+To use a different host directory, set `PROXY_HOST_DIR` when starting Compose (the directory should still contain `proxy.txt` unless you change `PROXY_FILE` in the compose file to match):
+
+```bash
+PROXY_HOST_DIR=/path/to/my-proxy-dir docker compose up --build -d
+```
+
+For a plain `docker run`, mount your own file or directory and set `PROXY_FILE` to the path inside the container, for example:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -v "$(pwd)/docker-proxy:/proxy:ro" \
+  -e PROXY_FILE=/proxy/proxy.txt \
+  spider-server:latest
 ```
 
 ## Notes on performance
