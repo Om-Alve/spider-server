@@ -24,4 +24,9 @@ services:
       REQUEST_BODY_LIMIT_MB: 2
       DEFAULT_CONTENT_CHARS: 4000
       MAX_CONTENT_CHARS: 100000
+      # Rotating proxies: put `proxy.txt` in the host directory mounted below (default ./docker-proxy).
+      PROXY_FILE: /proxy/proxy.txt
+    volumes:
+      # Host path is overridable: PROXY_HOST_DIR=/path/to/dir docker compose up
+      - ${PROXY_HOST_DIR:-./docker-proxy}:/proxy:ro
     restart: unless-stopped
