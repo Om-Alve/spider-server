@@ -102,6 +102,59 @@ Response (shape):
 
 `markdown` is present only when `include_markdown` is true, or when `response_format` is `markdown`. The `content` string uses `fit_markdown` when `response_format` is `markdown` and `include_content` is true.
 
+### Batch scrape
+
+`POST /scrape/batch`
+
+Runs multiple single-page scrape requests concurrently. Throughput is higher than issuing separate `POST /scrape` calls because the work shares one HTTP round-trip and uses a bounded global concurrency plus optional per-host limits (so many URLs to the same site do not all hit at once).
+
+Example:
+
+```bash
+curl -s -X POST http://localhost:8080/scrape/batch \
+  -H 'content-type: application/json' \
+  -d '{
+    "requests": [
+      { "url": "https://spider.cloud", "crawl_mode": "http", "include_content": true },
+      { "url": "https://www.rust-lang.org", "crawl_mode": "http", "include_content": true }
+    ],
+    "global_concurrency": 16,
+    "per_host_concurrency": 4
+  }'
+```
+
+Request fields:
+
+- `requests` (required): non-empty array; each element has the same fields as `POST /scrape` (including `url`, timeouts, `crawl_mode`, `response_format`, markdown options, etc.).
+- `global_concurrency` (optional): max concurrent scrapes in this batch. Default: `SCRAPE_BATCH_GLOBAL_CONCURRENCY` env or `16`. Minimum effective value is `1`.
+- `per_host_concurrency` (optional): max concurrent scrapes per host (derived from each URL). Default: `SCRAPE_BATCH_PER_HOST` env or `4`. Minimum effective value is `1`.
+
+Limits: batch length is capped by `MAX_BATCH_SIZE` (same as `/crawl/batch`; default `64`).
+
+Response (shape):
+
+```json
+{
+  "batch_duration_ms": 450,
+  "results": [
+    {
+      "index": 0,
+      "ok": true,
+      "duration_ms": 320,
+      "response": { "root_url": "https://spider.cloud", "mode_used": "http", "page": {} }
+    },
+    {
+      "index": 1,
+      "ok": false,
+      "duration_ms": 120,
+      "error": "..."
+    }
+  ]
+}
+```
+
+Each result includes `index` matching the position in `requests`. Failures are reported per item (`ok: false`, `error` string); other items still complete.
+
 ### Crawl
 
 `POST /crawl`

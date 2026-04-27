@@ -450,10 +450,19 @@ async fn scrape_batch(
             "requests must contain at least one item",
         ));
     }
-    let max_b = read_env_parse("MAX_SCRAPE_BATCH", 32usize);
-    if payload.requests.len() > max_b {
+
+    let batch_size = clamp(
+        payload.requests.len(),
+        1,
+        state
+            .config
+            .max_batch_size
+            .max(state.config.default_batch_size),
+    );
+    if payload.requests.len() > batch_size {
         return Err(ApiError::bad_request(format!(
-            "batch size exceeds maximum ({max_b})"
+            "batch size exceeds configured maximum: {}",
+            state.config.max_batch_size
         )));
     }
     let global_c = payload
